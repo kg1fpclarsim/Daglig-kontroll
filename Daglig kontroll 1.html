@@ -1,0 +1,2464 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Överblick - Daglig Kontroll</title>
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script>Babel.registerPreset('react-classic', { presets: [['react', { runtime: 'classic' }]] });</script>
+    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
+    <style>
+        .hide-scrollbar::-webkit-scrollbar { display: none; }
+        .hide-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+        @media print {
+            body { background-color: white !important; }
+            .no-print { display: none !important; }
+            .print-break-inside-avoid { break-inside: avoid; }
+            .print-only { display: block !important; }
+            /* För att tvinga fram bakgrundsfärger i PDF:en */
+            * { -webkit-print-color-adjust: exact !important; color-adjust: exact !important; }
+        }
+    </style>
+</head>
+<body class="bg-slate-100 text-slate-800 font-sans antialiased">
+    <div id="root"></div>
+
+    <script type="text/babel" data-presets="react-classic">
+        // Safe localStorage – faller tillbaka på in-memory om Edge/Tracking Prevention blockerar
+        const localStorage = (() => {
+            try {
+                window.localStorage.setItem('__colix_test__', '1');
+                window.localStorage.removeItem('__colix_test__');
+                return window.localStorage;
+            } catch(e) {
+                const _mem = {};
+                return {
+                    getItem: k => (_mem[k] !== undefined ? _mem[k] : null),
+                    setItem: (k, v) => { _mem[k] = String(v); },
+                    removeItem: k => { delete _mem[k]; }
+                };
+            }
+        })();
+
+        // ==========================================
+        // 🔧 KONFIGURATION & API
+        // ==========================================
+        const USE_MOCK_DATA = false;
+
+        const FORMS = {
+            VEHICLES: "8e789ff5-7132-452d-be8a-8afd2bcbc893",
+            CHECKS: "403c9b2d-d1be-489b-b575-681a435617e4",
+            POST_CHECKS: "daed8626-5005-4087-af1c-16f41a1ecb93" 
+        };
+
+        // ==========================================
+        // 🛠 HJÄLPFUNKTIONER
+        // ==========================================
+        const normalizeRegNr = (str) => String(str || '').toUpperCase().replace(/\s+/g, '');
+
+        // Funktion för att plocka bort dubbletter (Samma bil, förare, och inom 15 min)
+        const removeDuplicates = (rows) => {
+            const sorted = [...rows].sort((a, b) => new Date(b['Datum/tid']) - new Date(a['Datum/tid']));
+            const unique = [];
+            for (const row of sorted) {
+                const regnr = String(row['Regnr Bil'] || '').trim().toUpperCase();
+                const respondent = String(row['Respondent (read-only)'] || '').trim().toLowerCase();
+                const timeStr = row['Datum/tid'];
+                if(!timeStr) { unique.push(row); continue; }
+                const time = new Date(timeStr).getTime();
+                
+                const isDuplicate = unique.some(u => {
+                    const uRegnr = String(u['Regnr Bil'] || '').trim().toUpperCase();
+                    const uRespondent = String(u['Respondent (read-only)'] || '').trim().toLowerCase();
+                    const uTime = new Date(u['Datum/tid']).getTime();
+                    
+                    if (regnr === uRegnr && respondent === uRespondent) {
+                        const diffMinutes = Math.abs(time - uTime) / (1000 * 60);
+                        return diffMinutes < 15;
+                    }
+                    return false;
+                });
+                
+                if (!isDuplicate) {
+                    unique.push(row);
+                }
+            }
+            return unique;
+        };
+
+        const analyzeCheckStatus = (check) => {
+            if (!check) return 'MISSING';
+            let hasWarning = false; // Gul (Egen åtgärd)
+            let hasError = false;   // Röd (Rapporterat fel)
+            let missingCritical = false; // Orange (Ofullständig)
+            
+            for (const key in check) {
+                if (['Datum/tid', 'Regnr Bil', 'Regnr Släp', 'Respondent (read-only)', 'Skapat (read-only)', 'Senast ändrat (read-only)', 'Formulärsvar ID (read-only)'].includes(key)) continue;
+                
+                const answer = check[key];
+                const isCritical = String(key).toLowerCase().match(/vätskor|olja|läckage|belysning|däck|mönsterdjup|lastsäkring|last/);
+
+                if (!answer || String(answer).trim() === '') {
+                    if (isCritical) missingCritical = true;
+                    continue;
+                }
+
+                const firstChar = String(answer).trim().charAt(0);
+                if (firstChar === '3') hasError = true;
+                else if (firstChar === '2') hasWarning = true;
+            }
+            
+            if (missingCritical) return 'INCOMPLETE';
+            if (hasError) return 'ERROR';
+            if (hasWarning) return 'WARNING';
+            return 'OK';
+        };
+
+        const shortenQuestion = (question) => {
+            const q = String(question).toLowerCase();
+            if (q.includes('motorolja') || q.includes('kylarvätska') || q.includes('läckage')) return 'Vätskor & Läckage';
+            if (q.includes('belysning')) return 'Belysning';
+            if (q.includes('däck') || q.includes('mönsterdjup')) return 'Däck';
+            if (q.includes('lastsäkring') || (q.includes('last') && q.includes('säkrad'))) return 'Lastsäkring';
+            if (q.includes('rundgång') || q.includes('skador på kaross')) return 'Rundgång (Yttre skador)';
+            if (q.includes('vindruta') || q.includes('speglar') || q.includes('sikt')) return 'Sikt & Rutor';
+            if (q.includes('koppling') || q.includes('vändskiva') || q.includes('luftslangar')) return 'Koppling & Slangar';
+            if (q.includes('tempererat') || q.includes('kyl')) return 'Tempererat gods';
+            if (q.includes('tak') || q.includes('snö')) return 'Tak (Snö/Is)';
+            if (q.includes('brandsläckare')) return 'Brandsläckare';
+            if (q.includes('färdskrivare')) return 'Färdskrivare';
+            if (q.includes('nödvändig adr-utrustning') || q.includes('om fordonet ska transportera farligt gods')) return 'ADR utrustning';
+            if (q.includes('transportdokument') || q.includes('dokument') || q.includes('kort')) return 'Dokumentation';
+            if (q.includes('säkerhetsbälte') || q.includes('lösa föremål')) return 'Säkerhet i hytt';
+            if (q.includes('städat') || q.includes('skräp') || q.includes('ren')) return 'Städning hytt';
+            if (q.includes('parkerad') || q.includes('uppställd')) return 'Parkering';
+            if (q.includes('nycklar') || q.includes('nyckel')) return 'Nyckelhantering';
+            return question.length > 35 ? question.substring(0, 35) + '...' : question;
+        };
+
+        const Icon = ({ name, className }) => {
+            if (name === 'trailer') return <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} width="24" height="24"><rect x="2" y="6" width="16" height="10" rx="1"></rect><circle cx="6" cy="18" r="2"></circle><circle cx="14" cy="18" r="2"></circle><path d="M18 14h4"></path></svg>;
+            if (name === 'parking') return <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} width="24" height="24"><rect width="18" height="18" x="3" y="3" rx="2"></rect><path d="M9 17v-10h4a3 3 0 0 1 0 6h-4"></path></svg>;
+            if (name === 'stethoscope') return <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}><path d="M11 2v2"/><path d="M5 2v2"/><path d="M5 3H4a2 2 0 0 0-2 2v4a6 6 0 0 0 12 0V5a2 2 0 0 0-2-2h-1"/><path d="M8 15a6 6 0 0 0 12 0v-3"/><circle cx="20" cy="10" r="2"/></svg>;
+
+            const svgContent = React.useMemo(() => {
+                try {
+                    const tempDiv = document.createElement('div');
+                    const i = document.createElement('i');
+                    i.setAttribute('data-lucide', name);
+                    tempDiv.appendChild(i);
+                    lucide.createIcons({ root: tempDiv, attrs: { class: className || '', width: '24', height: '24' } });
+                    if (tempDiv.innerHTML.includes('<i ')) return '';
+                    return tempDiv.innerHTML;
+                } catch (e) { return ''; }
+            }, [name, className]);
+
+            if (!svgContent) return <span className={`inline-block ${className}`} style={{ width: 24, height: 24 }}></span>;
+            return <span dangerouslySetInnerHTML={{ __html: svgContent }} />;
+        };
+
+        // ==========================================
+        // ⚛️ HUVUDKOMPONENT (REACT)
+        // ==========================================
+        const App = () => {
+            const [vehicles, setVehicles] = React.useState(() => JSON.parse(localStorage.getItem('colix_cached_vehicles') || '[]'));
+            const [trailers, setTrailers] = React.useState(() => JSON.parse(localStorage.getItem('colix_cached_trailers') || '[]')); 
+            const [departments, setDepartments] = React.useState(() => JSON.parse(localStorage.getItem('colix_cached_deps') || '[]'));
+            
+            const [checks, setChecks] = React.useState([]);
+            const [postChecks, setPostChecks] = React.useState([]); 
+            const [unknownVehicles, setUnknownVehicles] = React.useState([]);
+            
+            const [activeTab, setActiveTab] = React.useState(() => {
+                const cachedDeps = JSON.parse(localStorage.getItem('colix_cached_deps') || '[]');
+                const customDepNames = Object.keys(JSON.parse(localStorage.getItem('colix_custom_deps') || '{}'));
+                const savedTab = localStorage.getItem('colix_active_tab');
+                if (savedTab && (cachedDeps.includes(savedTab) || customDepNames.includes(savedTab) || savedTab === 'Okända fordon')) return savedTab;
+                if (cachedDeps.length > 0) return cachedDeps[0];
+                return '';
+            });
+
+            const [globalMessage, setGlobalMessage] = React.useState(null);
+            const showAlert = (title, message) => setGlobalMessage({ title, message });
+
+            const [lastVehicleUpdate, setLastVehicleUpdate] = React.useState(() => localStorage.getItem('colix_vehicle_updated_at') || null);
+            const [loadingVehicles, setLoadingVehicles] = React.useState(false);
+            
+            const [currentView, setCurrentView] = React.useState('overview');
+            const [showTVSettings, setShowTVSettings] = React.useState(false);
+            
+            const [loading, setLoading] = React.useState(true);
+            const [refreshing, setRefreshing] = React.useState(false);
+            
+            const [selectedVehicle, setSelectedVehicle] = React.useState(null);
+            const [currentCheckIndex, setCurrentCheckIndex] = React.useState(0);
+            const [reportModalData, setReportModalData] = React.useState(null);
+            
+            const [selectedDate, setSelectedDate] = React.useState(new Date().toISOString().split('T')[0]);
+
+            const [draggedItem, setDraggedItem] = React.useState(null);
+            const [dragOverItem, setDragOverItem] = React.useState(null);
+            const dragOccurred = React.useRef(false); 
+
+            const [draggedDep, setDraggedDep] = React.useState(null);
+            const [dragOverDep, setDragOverDep] = React.useState(null);
+
+            const [hiddenVehicles, setHiddenVehicles] = React.useState(() => JSON.parse(localStorage.getItem('colix_hidden_vehicles') || '[]'));
+            const [customOrder, setCustomOrder] = React.useState(() => JSON.parse(localStorage.getItem('colix_vehicle_order') || '[]'));
+            const [depOrder, setDepOrder] = React.useState(() => JSON.parse(localStorage.getItem('colix_dep_order') || '[]'));
+            
+            const [tvSettings, setTvSettings] = React.useState(() => {
+                const saved = JSON.parse(localStorage.getItem('colix_tv_settings') || 'null');
+                if (saved) {
+                    return {
+                        departments: saved.departments || [],
+                        refreshInterval: saved.refreshInterval !== undefined ? saved.refreshInterval : 5,
+                        maxPerPage: saved.maxPerPage || 24,
+                        carouselSpeed: saved.carouselSpeed !== undefined ? saved.carouselSpeed : 10
+                    };
+                }
+                return { departments: [], refreshInterval: 5, maxPerPage: 24, carouselSpeed: 10 };
+            });
+
+            const [sortMethod, setSortMethod] = React.useState(() => localStorage.getItem('colix_sort_method') || 'custom');
+            const [currentSlideIndex, setCurrentSlideIndex] = React.useState(0);
+            const [customDeps, setCustomDeps] = React.useState(() => JSON.parse(localStorage.getItem('colix_custom_deps') || '{}'));
+
+            const [showCreateDepModal, setShowCreateDepModal] = React.useState(false);
+            const [newDepName, setNewDepName] = React.useState('');
+            const [depToDelete, setDepToDelete] = React.useState(null);
+            const [vehicleMenuOpen, setVehicleMenuOpen] = React.useState(null);
+
+            const [reportPeriod, setReportPeriod] = React.useState('7days');
+            const [customReportStart, setCustomReportStart] = React.useState('');
+            const [customReportEnd, setCustomReportEnd] = React.useState('');
+            
+            // Multiselect avdelningar istället för sträng
+            const [reportDepartments, setReportDepartments] = React.useState([]);
+            const [reportDepOpen, setReportDepOpen] = React.useState(false);
+            
+            const [reportTab, setReportTab] = React.useState('overview'); 
+            const [reportChecks, setReportChecks] = React.useState([]);
+            const [reportPostChecks, setReportPostChecks] = React.useState([]);
+            const [loadingReport, setLoadingReport] = React.useState(false);
+
+            const buildIframeUrl = (formAnswerId) => {
+                return `https://app.colix.se/lodjuret/fordonskontroll/forms-tab-widget/3678c7df-91f4-2b8d-dbbb-ac188e135657/8e789ff5-7132-452d-be8a-8afd2bcbc893/${formAnswerId}/subform/26ec6941-8ad9-45e6-88aa-abbbf2fc1d58?listGuid=26e1ea3d-e82b-4df7-a152-db3bbe696f76`;
+            };
+
+            React.useEffect(() => { localStorage.setItem('colix_hidden_vehicles', JSON.stringify(hiddenVehicles)); }, [hiddenVehicles]);
+            React.useEffect(() => { localStorage.setItem('colix_vehicle_order', JSON.stringify(customOrder)); }, [customOrder]);
+            React.useEffect(() => { localStorage.setItem('colix_dep_order', JSON.stringify(depOrder)); }, [depOrder]);
+            React.useEffect(() => { localStorage.setItem('colix_tv_settings', JSON.stringify(tvSettings)); }, [tvSettings]);
+            React.useEffect(() => { localStorage.setItem('colix_sort_method', sortMethod); }, [sortMethod]);
+            React.useEffect(() => { localStorage.setItem('colix_active_tab', activeTab); }, [activeTab]);
+            React.useEffect(() => { localStorage.setItem('colix_custom_deps', JSON.stringify(customDeps)); }, [customDeps]);
+
+            React.useEffect(() => { localStorage.setItem('colix_cached_vehicles', JSON.stringify(vehicles)); }, [vehicles]);
+            React.useEffect(() => { localStorage.setItem('colix_cached_trailers', JSON.stringify(trailers)); }, [trailers]);
+            React.useEffect(() => { localStorage.setItem('colix_cached_deps', JSON.stringify(departments)); }, [departments]);
+            React.useEffect(() => { if (lastVehicleUpdate) localStorage.setItem('colix_vehicle_updated_at', lastVehicleUpdate); }, [lastVehicleUpdate]);
+
+            React.useEffect(() => {
+                const closeMenu = () => setVehicleMenuOpen(null);
+                window.addEventListener('click', closeMenu);
+                return () => window.removeEventListener('click', closeMenu);
+            }, []);
+
+            React.useEffect(() => {
+                let intervalId;
+                if (currentView === 'tv' && tvSettings.refreshInterval > 0) {
+                    intervalId = setInterval(() => { fetchChecks(true); }, tvSettings.refreshInterval * 60 * 1000);
+                }
+                return () => { if (intervalId) clearInterval(intervalId); };
+            }, [currentView, tvSettings.refreshInterval, selectedDate]);
+
+            React.useEffect(() => {
+                if (currentView !== 'tv') return;
+                const dateCheckInterval = setInterval(() => {
+                    const todayStr = new Date().toISOString().split('T')[0];
+                    setSelectedDate(prevDate => prevDate !== todayStr ? todayStr : prevDate);
+                }, 60000);
+                return () => clearInterval(dateCheckInterval);
+            }, [currentView]);
+
+            const API_HEADERS = {
+                "Accept": "application/json, text/plain, */*",
+                "Authorization": "Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6IjkzNzkwN0Y1MUIwNUFEMzdEMTVGQ0NGMTk0M0M1NzhGRjMwRERCMUNSUzI1NiIsIng1dCI6Imsza0g5UnNGclRmUlg4enhsRHhYal9NTjJ4dyIsInR5cCI6ImF0K2p3dCJ9.eyJpc3MiOiJodHRwczovL2xvZ2luLmNvbGl4c3lzdGVtcy5jb20iLCJuYmYiOjE3NzE4MjYyMjUsImlhdCI6MTc3MTgyNjIyNSwiZXhwIjoyMDg3Mzk1NzQ1LCJhdWQiOlsiQ29saXhBcHBsZXRzLkFQSSIsIkNvbGl4QXBwbGV0cy5QbHVnaW5zLkFQSSJdLCJzY29wZSI6WyJvcGVuaWQiLCJwcm9maWxlIiwiQ29saXhBcHBsZXRzLkFQSSIsIkNvbGl4QXBwbGV0cy5QbHVnaW5zLkFQSSJdLCJhbXIiOlsicHdkIl0sImNsaWVudF9pZCI6IjI0NDBlYWM1LTQxMjUtNDk1NS1iODEwLWJjODlhY2U0OWQyMyIsInN1YiI6IjI0MTAxOTE4LTllMzktNDBlOS05YzI4LWE4MzMwOWU2NWMzNyIsImF1dGhfdGltZSI6MTc3MDM2NzQ1OSwiaWRwIjoibG9jYWwiLCJpZCI6ImxhcnMuc2ltb25zc29uQHNtYWxhbmRzbG9naXN0aWsuc2UiLCJuYW1lIjoiTGFycyBTaW1vbnNzb24iLCJlbWFpbCI6ImxhcnMuc2ltb25zc29uQHNtYWxhbmRzbG9naXN0aWsuc2UiLCJ0b2tlbl9saWZldGltZSI6IjM2MDAwIiwiYXV0aF92aWFfYmFua2lkIjoidHJ1ZSIsInNpZCI6IjFBMEY0MzMxQzE1NDc5QTU5QUNDNEFDQzYzQkMyQ0Y4In0.J-8yrx15MrTBIZXKJo-pfadzAFeGzl5Ata2nP2zNGWjVWKfSSAehxT4Z7npVPl3ao7QcfyIo5LDwvhSKG-Hk_yHh_LIcv8vPSPXP0Ser6W-HJGjl6GV52BzbC9SF2Q-Vkdtyy4O8t-jL9fbZDw95xYcqG9wzOXgnmOa_tYJ-dWbBr5_FRSciWZziKA1tT76YVkz3V1dBPna3KTSgXZ5PInyNB9O8MBeJzTpIGsDMy95TxVZwWLpk33e-x9rU9_vmin4-3Q2BmSDa1QtWTbW6Da_yKXLMY_6Hk8PXWyWkwDjAgg2ynVgIXcrDW3Kcy5-tWi2INJYv2bEw2B5rHbnZVQ",
+                "SubscriptionGuid": "e0833ead-e307-4b47-94ef-85437367b8ad",
+                "Cache-Control": "no-cache", "Pragma": "no-cache"
+            };
+
+            const fetchVehicles = async () => {
+                setLoadingVehicles(true);
+                try {
+                    if (!USE_MOCK_DATA) {
+                        const vRes = await fetch(`https://colixpluginsformsapi.azurewebsites.net/api/v4/form/${FORMS.VEHICLES}/form-content/excel`, { method: 'GET', headers: API_HEADERS });
+                        if (!vRes.ok) throw new Error("Kunde inte hämta fordon");
+                        const vBuf = await vRes.arrayBuffer();
+                        const vWb = XLSX.read(vBuf, { type: 'array' });
+                        const vehicleData = XLSX.utils.sheet_to_json(vWb.Sheets[vWb.SheetNames[0]], { raw: false, defval: "" });
+
+                        const rawTrucks = vehicleData.filter(v => String(v['Fordonstyp'] || '').trim().toLowerCase() === 'lastbil');
+                        const rawTrailers = vehicleData.filter(v => {
+                            const type = String(v['Fordonstyp'] || '').trim().toLowerCase();
+                            return type === 'släpvagn' || type === 'släp';
+                        });
+                        
+                        const processedTrucks = rawTrucks.map(t => ({
+                            ...t, Namn: String(t['Namn'] || '').trim().toUpperCase(),
+                            Avdelning: String(t['Avdelning'] || '').trim() || 'Oplacerad',
+                            Internreferens: String(t['Internreferens'] || '').trim().toUpperCase()
+                        }));
+
+                        const processedTrailers = rawTrailers.map(t => ({
+                            ...t, Namn: String(t['Namn'] || '').trim().toUpperCase(),
+                            Internreferens: String(t['Internreferens'] || '').trim().toUpperCase()
+                        }));
+
+                        const deps = [...new Set(processedTrucks.map(t => t.Avdelning))].sort();
+                        setVehicles(processedTrucks);
+                        setTrailers(processedTrailers);
+                        setDepartments(deps);
+
+                        const now = new Date();
+                        const timeStr = now.toLocaleDateString('sv-SE') + ' ' + now.toLocaleTimeString('sv-SE', {hour: '2-digit', minute:'2-digit'});
+                        setLastVehicleUpdate(timeStr);
+
+                        if (!activeTab && deps.length > 0) setActiveTab(deps[0]);
+                    }
+                } catch (error) {
+                    console.error("Fel vid hämtning av fordon:", error);
+                    showAlert("Fel vid hämtning", "Kunde inte hämta fordonslistan. Kontrollera nätverket.");
+                } finally {
+                    setLoadingVehicles(false);
+                }
+            };
+
+            const fetchChecks = async (isRefresh = false) => {
+                if (isRefresh) setRefreshing(true); else setLoading(true);
+
+                try {
+                    if (!USE_MOCK_DATA) {
+                        const startDateObj = new Date(selectedDate);
+                        startDateObj.setDate(startDateObj.getDate() - 3); 
+                        const endDateObj = new Date(selectedDate);
+                        endDateObj.setDate(endDateObj.getDate() + 3); 
+
+                        const formatIsoStr = (dateObj, isEnd) => {
+                            const y = dateObj.getFullYear();
+                            const m = String(dateObj.getMonth() + 1).padStart(2, '0');
+                            const d = String(dateObj.getDate()).padStart(2, '0');
+                            return isEnd ? `${y}-${m}-${d}T23:59:59` : `${y}-${m}-${d}T00:00:00`;
+                        };
+
+                        const startStr = formatIsoStr(startDateObj, false);
+                        const endStr = formatIsoStr(endDateObj, true);
+                        
+                        const filterQuery = encodeURIComponent(JSON.stringify({ startDate: startStr, endDate: endStr }));
+
+                        const cRes = await fetch(`https://colixpluginsformsapi.azurewebsites.net/api/v4/form/${FORMS.CHECKS}/form-content/excel?timePeriodFilter=${filterQuery}`, { method: 'GET', headers: API_HEADERS });
+                        if (!cRes.ok) throw new Error("Kunde inte hämta kontroller");
+                        const cWb = XLSX.read(await cRes.arrayBuffer(), { type: 'array' });
+                        const rawCData = XLSX.utils.sheet_to_json(cWb.Sheets[cWb.SheetNames[0]], { raw: false, defval: "" });
+
+                        const pcRes = await fetch(`https://colixpluginsformsapi.azurewebsites.net/api/v4/form/${FORMS.POST_CHECKS}/form-content/excel?timePeriodFilter=${filterQuery}`, { method: 'GET', headers: API_HEADERS });
+                        if (!pcRes.ok) throw new Error("Kunde inte hämta efter-kontroller");
+                        const pcWb = XLSX.read(await pcRes.arrayBuffer(), { type: 'array' });
+                        const rawPcData = XLSX.utils.sheet_to_json(pcWb.Sheets[pcWb.SheetNames[0]], { raw: false, defval: "" });
+                        
+                        // Tvättar bort dubbletter inlämnade inom 15 minuter för samma fordon av samma förare
+                        setChecks(removeDuplicates(rawCData));
+                        setPostChecks(removeDuplicates(rawPcData));
+                    }
+                } catch (error) {
+                    console.error("Fel vid hämtning av kontroller:", error);
+                    showAlert("Fel vid hämtning", "Kunde inte hämta kontroller från Colix.");
+                } finally {
+                    setLoading(false); setRefreshing(false);
+                }
+            };
+
+            const getPeriodDates = (period) => {
+                const end = new Date(); const start = new Date();
+                end.setHours(23, 59, 59, 999); start.setHours(0, 0, 0, 0);
+
+                if (period === '7days') start.setDate(start.getDate() - 6);
+                else if (period === 'thisMonth') start.setDate(1);
+                else if (period === 'lastMonth') {
+                    start.setMonth(start.getMonth() - 1); start.setDate(1);
+                    end.setMonth(end.getMonth() - 1);
+                    end.setDate(new Date(end.getFullYear(), end.getMonth() + 1, 0).getDate());
+                    end.setHours(23, 59, 59, 999);
+                } else if (period === 'ytd') start.setMonth(0, 1);
+                
+                const format = (d) => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}T${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
+                return { startStr: format(start), endStr: format(end) };
+            };
+
+            const fetchReportData = async () => {
+                setLoadingReport(true);
+                try {
+                    if (!USE_MOCK_DATA) {
+                        let startStr, endStr;
+                        if (reportPeriod === 'custom') {
+                            if(!customReportStart || !customReportEnd) { setLoadingReport(false); return; }
+                            startStr = `${customReportStart}T00:00:00`; endStr = `${customReportEnd}T23:59:59`;
+                        } else {
+                            const dates = getPeriodDates(reportPeriod);
+                            startStr = dates.startStr; endStr = dates.endStr;
+                        }
+                        
+                        const filterQuery = encodeURIComponent(JSON.stringify({ startDate: startStr, endDate: endStr }));
+
+                        const cRes = await fetch(`https://colixpluginsformsapi.azurewebsites.net/api/v4/form/${FORMS.CHECKS}/form-content/excel?timePeriodFilter=${filterQuery}`, { method: 'GET', headers: API_HEADERS });
+                        if (!cRes.ok) throw new Error("Kunde inte hämta rapportkontroller");
+                        const cWb = XLSX.read(await cRes.arrayBuffer(), { type: 'array' });
+                        const rawCData = XLSX.utils.sheet_to_json(cWb.Sheets[cWb.SheetNames[0]], { raw: false, defval: "" });
+
+                        const pcRes = await fetch(`https://colixpluginsformsapi.azurewebsites.net/api/v4/form/${FORMS.POST_CHECKS}/form-content/excel?timePeriodFilter=${filterQuery}`, { method: 'GET', headers: API_HEADERS });
+                        if (!pcRes.ok) throw new Error("Kunde inte hämta rapport efter-kontroller");
+                        const pcWb = XLSX.read(await pcRes.arrayBuffer(), { type: 'array' });
+                        const rawPcData = XLSX.utils.sheet_to_json(pcWb.Sheets[pcWb.SheetNames[0]], { raw: false, defval: "" });
+                        
+                        setReportChecks(removeDuplicates(rawCData));
+                        setReportPostChecks(removeDuplicates(rawPcData));
+                    }
+                } catch (error) {
+                    console.error("Fel vid hämtning av rapport:", error); 
+                    showAlert("Fel vid hämtning", "Kunde inte hämta rapportdata från Colix.");
+                } finally {
+                    setLoadingReport(false);
+                }
+            };
+
+            React.useEffect(() => {
+                const initData = async () => { if (vehicles.length === 0) await fetchVehicles(); };
+                initData();
+            }, []);
+
+            React.useEffect(() => {
+                if (currentView === 'overview' || currentView === 'tv') fetchChecks();
+            }, [selectedDate, currentView]);
+
+            React.useEffect(() => {
+                if (currentView === 'reports') {
+                    if (reportPeriod !== 'custom' || (customReportStart && customReportEnd)) fetchReportData();
+                }
+            }, [currentView, reportPeriod, customReportStart, customReportEnd]);
+
+            const findVehicleByAnyReference = (inputStr) => {
+                if (!inputStr) return null;
+                const normalized = normalizeRegNr(inputStr);
+                return vehicles.find(v => normalizeRegNr(v['Namn']) === normalized || normalizeRegNr(v['Internreferens']) === normalized);
+            };
+
+            const findTrailerByAnyReference = (inputStr) => {
+                if (!inputStr) return null;
+                const normalized = normalizeRegNr(inputStr);
+                return trailers.find(t => normalizeRegNr(t['Namn']) === normalized || normalizeRegNr(t['Internreferens']) === normalized);
+            };
+
+            const getChecksForDate = (vehicleName) => {
+                const dateChecks = checks.filter(c => {
+                    const checkDateStr = String(c['Datum/tid'] || '');
+                    if (!checkDateStr.includes(selectedDate)) return false;
+                    const matchedVehicle = findVehicleByAnyReference(String(c['Regnr Bil'] || ''));
+                    return matchedVehicle && matchedVehicle['Namn'] === vehicleName;
+                });
+                if (dateChecks.length === 0) return { latest: null, all: [] };
+                const sorted = dateChecks.sort((a, b) => new Date(b['Datum/tid']) - new Date(a['Datum/tid']));
+                return { latest: sorted[0], all: sorted };
+            };
+
+            const getOnlyPostChecksForDate = (vehicleName) => {
+                const dateChecks = postChecks.filter(pc => {
+                     const checkDateStr = String(pc['Datum/tid'] || '');
+                     if (!checkDateStr.includes(selectedDate)) return false;
+                     
+                     const matchedVehicle = findVehicleByAnyReference(String(pc['Regnr Bil'] || ''));
+                     if (!matchedVehicle || matchedVehicle['Namn'] !== vehicleName) return false;
+
+                     const pcTime = new Date(pc['Datum/tid']).getTime();
+                     const pcDriver = String(pc['Respondent (read-only)'] || '').trim().toLowerCase();
+
+                     const hasMatchingPreCheck = checks.some(pre => {
+                         const preMatchedVehicle = findVehicleByAnyReference(String(pre['Regnr Bil'] || ''));
+                         if (!preMatchedVehicle || preMatchedVehicle['Namn'] !== vehicleName) return false;
+                         
+                         if (String(pre['Respondent (read-only)'] || '').trim().toLowerCase() !== pcDriver) return false;
+                         
+                         const preTime = new Date(pre['Datum/tid']).getTime();
+                         const diffHours = (pcTime - preTime) / (1000 * 60 * 60);
+                         return diffHours >= 0 && diffHours <= 72;
+                     });
+
+                     return !hasMatchingPreCheck;
+                });
+                if (dateChecks.length === 0) return { latest: null, all: [] };
+                const sorted = dateChecks.sort((a, b) => new Date(b['Datum/tid']) - new Date(a['Datum/tid']));
+                return { latest: sorted[0], all: sorted };
+            };
+
+            const getPostCheckForPreCheck = (preCheck) => {
+                if (!preCheck || !preCheck['Datum/tid']) return null;
+                const matchedPreVehicle = findVehicleByAnyReference(String(preCheck['Regnr Bil'] || ''));
+                if (!matchedPreVehicle) return null;
+                const preVehicleName = matchedPreVehicle['Namn'];
+                const preDriver = String(preCheck['Respondent (read-only)'] || '').trim().toLowerCase();
+                const preTime = new Date(preCheck['Datum/tid']).getTime();
+
+                const candidates = postChecks.filter(pc => {
+                    const matchedPcVehicle = findVehicleByAnyReference(String(pc['Regnr Bil'] || ''));
+                    if (!matchedPcVehicle || matchedPcVehicle['Namn'] !== preVehicleName) return false;
+                    if (String(pc['Respondent (read-only)'] || '').trim().toLowerCase() !== preDriver) return false;
+                    const pcTime = new Date(pc['Datum/tid']).getTime();
+                    const diffHours = (pcTime - preTime) / (1000 * 60 * 60);
+                    return diffHours >= 0 && diffHours <= 72;
+                });
+
+                if (candidates.length === 0) return null;
+                candidates.sort((a, b) => new Date(a['Datum/tid']).getTime() - new Date(b['Datum/tid']).getTime());
+                return candidates[0];
+            };
+
+            React.useEffect(() => {
+                if (loading || currentView === 'reports') return; 
+                const unknownMap = new Map();
+
+                const processUnknown = (c, isPost) => {
+                    const dateStr = String(c['Datum/tid'] || '');
+                    if (!dateStr.includes(selectedDate)) return;
+                    const rawInput = String(c['Regnr Bil'] || '').trim().toUpperCase();
+                    if (!rawInput) return;
+
+                    if (!findVehicleByAnyReference(rawInput)) {
+                        if (!unknownMap.has(rawInput)) {
+                            unknownMap.set(rawInput, {
+                                Namn: rawInput, Avdelning: 'Okända fordon', isUnknown: true,
+                                checks: { latest: null, all: [] }, postChecks: { latest: null, all: [] }
+                            });
+                        }
+                        const v = unknownMap.get(rawInput);
+                        if (isPost) {
+                            v.postChecks.all.push(c);
+                            v.postChecks.all.sort((a, b) => new Date(b['Datum/tid']) - new Date(a['Datum/tid']));
+                            v.postChecks.latest = v.postChecks.all[0];
+                        } else {
+                            v.checks.all.push(c);
+                            v.checks.all.sort((a, b) => new Date(b['Datum/tid']) - new Date(a['Datum/tid']));
+                            v.checks.latest = v.checks.all[0];
+                        }
+                    }
+                };
+
+                checks.forEach(c => processUnknown(c, false));
+                postChecks.forEach(pc => processUnknown(pc, true));
+                setUnknownVehicles(Array.from(unknownMap.values()));
+            }, [checks, postChecks, selectedDate, loading, vehicles, currentView]);
+
+            const formatTrailerDisplay = (rawTrailerRegNr) => {
+                if (!rawTrailerRegNr) return null;
+                const trailerData = findTrailerByAnyReference(rawTrailerRegNr);
+                const displayReg = trailerData ? trailerData['Namn'] : String(rawTrailerRegNr).trim().toUpperCase();
+                if (trailerData && trailerData.Internreferens) return `${trailerData.Internreferens} (${displayReg})`;
+                return displayReg;
+            };
+
+            // ==========================================
+            // DRAG & DROP LOGIK
+            // ==========================================
+            const handleDepDragStart = (e, depName) => { setDraggedDep(depName); e.dataTransfer.effectAllowed = "move"; setTimeout(() => { if (e.target) e.target.classList.add('opacity-50'); }, 0); };
+            const handleDepDragOver = (e, depName) => { e.preventDefault(); if (dragOverDep !== depName) setDragOverDep(depName); };
+            const handleDepDragEnd = (e) => { if (e.target) e.target.classList.remove('opacity-50'); setDraggedDep(null); setDragOverDep(null); };
+            const handleDepDrop = (e, targetDepName) => {
+                e.preventDefault(); e.stopPropagation();
+                if (!draggedDep || draggedDep === targetDepName) { setDragOverDep(null); return; }
+                const currentList = [...sortedDepartments];
+                const draggedIndex = currentList.indexOf(draggedDep);
+                const targetIndex = currentList.indexOf(targetDepName);
+                if (draggedIndex === -1 || targetIndex === -1) return;
+                const newList = [...currentList];
+                newList.splice(draggedIndex, 1); newList.splice(targetIndex, 0, draggedDep);
+                setDepOrder(newList); setDragOverDep(null);
+            };
+
+            const handleDragStart = (e, vehicleName) => { dragOccurred.current = true; setDraggedItem(vehicleName); e.dataTransfer.effectAllowed = "move"; setTimeout(() => { if (e.target) e.target.classList.add('opacity-50'); }, 0); };
+            const handleDragOver = (e, vehicleName) => { e.preventDefault(); if (dragOverItem !== vehicleName) setDragOverItem(vehicleName); };
+            const handleDragEnd = (e) => { if (e.target) e.target.classList.remove('opacity-50'); setDraggedItem(null); setDragOverItem(null); setTimeout(() => { dragOccurred.current = false; }, 50); };
+            const handleDrop = (e, targetVehicleName) => {
+                e.preventDefault(); e.stopPropagation();
+                if (!draggedItem || draggedItem === targetVehicleName) { setDragOverItem(null); return; }
+                const currentList = sortedActiveVehicles.map(v => v['Namn']);
+                const draggedIndex = currentList.indexOf(draggedItem);
+                const targetIndex = currentList.indexOf(targetVehicleName);
+                if (draggedIndex === -1 || targetIndex === -1) return;
+                const newList = [...currentList];
+                newList.splice(draggedIndex, 1); newList.splice(targetIndex, 0, draggedItem);
+                setCustomOrder(Array.from(new Set([...newList, ...customOrder]))); setDragOverItem(null);
+                
+                if (sortMethod !== 'custom') setSortMethod('custom');
+            };
+
+            const toggleHideVehicle = (e, vehicleName) => {
+                e.stopPropagation();
+                setHiddenVehicles(prev => prev.includes(vehicleName) ? prev.filter(name => name !== vehicleName) : [...prev, vehicleName]);
+            };
+
+            const toggleTvDepartment = (dep) => {
+                setTvSettings(prev => {
+                    const deps = [...prev.departments];
+                    if (deps.includes(dep)) return { ...prev, departments: deps.filter(d => d !== dep) };
+                    return { ...prev, departments: [...deps, dep] };
+                });
+            };
+
+            const handleCreateDep = () => {
+                const name = newDepName.trim();
+                if (!name) return;
+                if (departments.includes(name) || customDeps.hasOwnProperty(name) || name === 'Okända fordon') { 
+                    showAlert("Ogiltigt namn", "Namnet används redan av en annan flik eller avdelning."); 
+                    return; 
+                }
+                setCustomDeps(prev => ({ ...prev, [name]: [] }));
+                setNewDepName(''); setShowCreateDepModal(false); setActiveTab(name);
+            };
+
+            const confirmDeleteDep = () => {
+                setCustomDeps(prev => { const updated = { ...prev }; delete updated[depToDelete]; return updated; });
+                setTvSettings(prev => ({ ...prev, departments: prev.departments.filter(d => d !== depToDelete) }));
+                if (activeTab === depToDelete && departments.length > 0) setActiveTab(departments[0]);
+                setDepToDelete(null);
+            };
+
+            const toggleVehicleInCustomDep = (vehicleName, depName) => {
+                setCustomDeps(prev => {
+                    const currentList = prev[depName] || [];
+                    if (currentList.includes(vehicleName)) return { ...prev, [depName]: currentList.filter(v => v !== vehicleName) };
+                    else return { ...prev, [depName]: [...currentList, vehicleName] };
+                });
+            };
+
+            const sortedDepartments = React.useMemo(() => {
+                let allBaseDeps = [...departments, ...Object.keys(customDeps)];
+                if (depOrder.length > 0) {
+                    allBaseDeps.sort((a, b) => {
+                        const idxA = depOrder.indexOf(a); const idxB = depOrder.indexOf(b);
+                        if (idxA !== -1 && idxB !== -1) return idxA - idxB;
+                        if (idxA !== -1) return -1; if (idxB !== -1) return 1;
+                        return 0;
+                    });
+                }
+                if (unknownVehicles.length > 0) allBaseDeps.push('Okända fordon');
+                return allBaseDeps;
+            }, [departments, customDeps, depOrder, unknownVehicles]);
+
+            const isUnknownTab = activeTab === 'Okända fordon';
+            const isCustomTab = customDeps.hasOwnProperty(activeTab);
+            
+            const currentTabVehicles = React.useMemo(() => {
+                if (isUnknownTab) return unknownVehicles;
+                if (isCustomTab) {
+                    const validRegs = customDeps[activeTab];
+                    return vehicles.filter(v => validRegs.includes(v['Namn']));
+                }
+                return vehicles.filter(v => v.Avdelning === activeTab);
+            }, [activeTab, isUnknownTab, isCustomTab, unknownVehicles, vehicles, customDeps]);
+
+            const activeVehicles = currentTabVehicles.filter(v => !hiddenVehicles.includes(v['Namn']));
+            const inactiveVehicles = currentTabVehicles.filter(v => hiddenVehicles.includes(v['Namn']));
+
+            const sortedActiveVehicles = React.useMemo(() => {
+                if (isUnknownTab) return activeVehicles; 
+                let vehiclesToSort = [...activeVehicles];
+                
+                if (sortMethod === 'internref') {
+                    vehiclesToSort.sort((a, b) => {
+                        const refA = String(a.Internreferens || a['Namn']).toLowerCase();
+                        const refB = String(b.Internreferens || b['Namn']).toLowerCase();
+                        return refA.localeCompare(refB, 'sv');
+                    });
+                } else if (sortMethod === 'regnr') {
+                    vehiclesToSort.sort((a, b) => {
+                        const nameA = String(a['Namn']).toLowerCase();
+                        const nameB = String(b['Namn']).toLowerCase();
+                        return nameA.localeCompare(nameB, 'sv');
+                    });
+                } else {
+                    if (customOrder.length > 0) {
+                        vehiclesToSort.sort((a, b) => {
+                            const idxA = customOrder.indexOf(a['Namn']); const idxB = customOrder.indexOf(b['Namn']);
+                            if (idxA !== -1 && idxB !== -1) return idxA - idxB;
+                            if (idxA !== -1) return -1; if (idxB !== -1) return 1;
+                            return 0;
+                        });
+                    }
+                }
+                return vehiclesToSort;
+            }, [activeVehicles, customOrder, isUnknownTab, sortMethod]);
+
+            const handleOpenReport = (e, vehicle, rawTrailer) => {
+                e.stopPropagation();
+                const truckId = vehicle['Formulärsvar ID (read-only)'];
+                
+                if (!truckId) {
+                    showAlert("ID Saknas", "Detta fordon saknar ett giltigt ID i registret och felrapporter kan inte visas.");
+                    return;
+                }
+
+                let trailerObj = null;
+                if (rawTrailer) {
+                    trailerObj = findTrailerByAnyReference(rawTrailer);
+                }
+
+                setReportModalData({
+                    truck: vehicle,
+                    truckId: truckId,
+                    trailerReg: rawTrailer,
+                    trailerObj: trailerObj
+                });
+            };
+
+            // ==========================================
+            // KORT-KOMPONENTER (Överblick & TV)
+            // ==========================================
+            const renderVehicleCard = (vehicle, isHidden = false) => {
+                let checkData, currentCheck, status, postCheck, postStatus;
+
+                if (vehicle.isUnknown) {
+                    checkData = vehicle.checks;
+                    currentCheck = checkData.latest;
+                    status = analyzeCheckStatus(currentCheck);
+                    postCheck = vehicle.postChecks.latest;
+                    postStatus = analyzeCheckStatus(postCheck);
+                } else {
+                    checkData = getChecksForDate(vehicle['Namn']);
+                    currentCheck = checkData.latest;
+                    status = analyzeCheckStatus(currentCheck);
+                    postCheck = getPostCheckForPreCheck(currentCheck);
+                    postStatus = postCheck ? analyzeCheckStatus(postCheck) : null;
+
+                    if (!currentCheck) {
+                        const orphanedPostData = getOnlyPostChecksForDate(vehicle['Namn']);
+                        if (orphanedPostData.latest) {
+                            postCheck = orphanedPostData.latest;
+                            postStatus = analyzeCheckStatus(postCheck);
+                            checkData = { latest: null, all: [], orphanedPost: orphanedPostData }; 
+                        }
+                    }
+                }
+                
+                const rawTrailer = currentCheck ? currentCheck['Regnr Släp'] : (postCheck ? postCheck['Regnr Släp'] : null);
+                const displayTrailer = formatTrailerDisplay(rawTrailer);
+                
+                let cardTheme = "bg-white border-slate-200 hover:border-slate-400";
+                let iconName = "clock";
+                let statusText = "Ej utförd detta datum";
+                let parkingColor = "text-slate-300 opacity-60"; 
+
+                if (currentCheck) {
+                    if (status === 'OK') { cardTheme = "bg-green-50 border-green-200 hover:border-green-400"; iconName = "circle-check"; statusText = "Kontrollerad (OK)"; } 
+                    else if (status === 'WARNING') { cardTheme = "bg-yellow-50 border-yellow-300 hover:border-yellow-500"; iconName = "triangle-alert"; statusText = "Egen åtgärd"; } 
+                    else if (status === 'ERROR') { cardTheme = "bg-red-50 border-red-300 hover:border-red-500"; iconName = "circle-x"; statusText = "Rapporterat fel"; }
+                    else if (status === 'INCOMPLETE') { cardTheme = "bg-orange-50 border-orange-300 hover:border-orange-500"; iconName = "file-question"; statusText = "Ofullständig"; }
+                } else if (postCheck) {
+                    cardTheme = "bg-slate-50 border-red-300 hover:border-red-500";
+                    iconName = "alert-triangle";
+                    statusText = "Saknar före-kontroll";
+                    status = "ERROR"; 
+                }
+
+                if (postCheck) {
+                    if (postStatus === 'OK') parkingColor = "text-green-500";
+                    if (postStatus === 'WARNING') parkingColor = "text-yellow-500";
+                    if (postStatus === 'ERROR') parkingColor = "text-red-500";
+                    if (postStatus === 'INCOMPLETE') parkingColor = "text-orange-500";
+                }
+
+                const displayCheck = currentCheck || postCheck; 
+                const isDragOver = dragOverItem === vehicle['Namn'];
+                const isDraggable = !isHidden && !vehicle.isUnknown && sortMethod === 'custom';
+                
+                let combinedClasses = `${cardTheme} ${isHidden ? "grayscale opacity-60 hover:opacity-100 hover:grayscale-0" : ""} ${isDragOver ? "border-blue-500 ring-2 ring-blue-300 scale-105 shadow-xl z-20" : ""} ${isDraggable ? "cursor-grab active:cursor-grabbing" : "cursor-pointer"}`;
+                if (vehicle.isUnknown) combinedClasses += " border-dashed border-2 border-indigo-300"; 
+
+                const hasCustomDeps = Object.keys(customDeps).length > 0;
+
+                return (
+                    <div 
+                        key={vehicle['Namn']}
+                        draggable={isDraggable}
+                        onDragStart={isDraggable ? (e) => handleDragStart(e, vehicle['Namn']) : undefined}
+                        onDragEnd={isDraggable ? handleDragEnd : undefined}
+                        onDragOver={isDraggable ? (e) => handleDragOver(e, vehicle['Namn']) : undefined}
+                        onDrop={isDraggable ? (e) => handleDrop(e, vehicle['Namn']) : undefined}
+                        onClick={() => {
+                            if (dragOccurred.current) return;
+                            setSelectedVehicle({ vehicle, checkData, status, orphanedPost: checkData?.orphanedPost });
+                            setCurrentCheckIndex(0);
+                        }}
+                        className={`relative rounded-xl border p-5 shadow-sm transition-all duration-200 hover:shadow-md group flex flex-col justify-between h-full ${combinedClasses}`}
+                    >
+                        <div className="absolute top-2 right-2 flex items-center gap-1 z-10">
+                            
+                            {!vehicle.isUnknown && (
+                                <div className="relative">
+                                    <button 
+                                        onClick={(e) => { e.stopPropagation(); setVehicleMenuOpen(vehicleMenuOpen === vehicle['Namn'] ? null : vehicle['Namn']); }}
+                                        className="p-2 rounded-lg text-slate-400 bg-white/80 hover:text-blue-600 hover:bg-blue-100 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-colors"
+                                        title="Lägg till i egen avdelning"
+                                    >
+                                        <Icon name="folder-plus" className="w-4 h-4" />
+                                    </button>
+                                    
+                                    {vehicleMenuOpen === vehicle['Namn'] && (
+                                        <div className="absolute right-0 top-full mt-1 w-48 bg-white border border-slate-200 shadow-xl rounded-xl z-30 p-2 animate-in fade-in slide-in-from-top-2" onClick={e=>e.stopPropagation()}>
+                                            <h4 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 px-1">Egna avdelningar</h4>
+                                            {hasCustomDeps ? (
+                                                Object.keys(customDeps).map(dep => (
+                                                    <label key={dep} className="flex items-center gap-3 p-2 hover:bg-slate-50 rounded-lg cursor-pointer transition-colors">
+                                                        <input 
+                                                            type="checkbox" 
+                                                            checked={customDeps[dep].includes(vehicle['Namn'])} 
+                                                            onChange={() => toggleVehicleInCustomDep(vehicle['Namn'], dep)} 
+                                                            className="w-4 h-4 text-blue-600 rounded border-slate-300 focus:ring-blue-500"
+                                                        />
+                                                        <span className="text-sm text-slate-700 font-medium truncate">{dep}</span>
+                                                    </label>
+                                                ))
+                                            ) : (
+                                                <div className="text-xs text-slate-400 px-1 pb-1">Inga egna avdelningar.</div>
+                                            )}
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+
+                            <button 
+                                onClick={(e) => toggleHideVehicle(e, vehicle['Namn'])}
+                                className={`p-2 rounded-lg transition-colors 
+                                    ${isHidden ? 'text-blue-600 bg-blue-100 hover:bg-blue-200' : 'text-slate-400 bg-white/80 hover:text-slate-700 hover:bg-slate-200 opacity-0 group-hover:opacity-100 focus:opacity-100'}
+                                `}
+                                title={isHidden ? "Visa fordon" : "Dölj fordon"}
+                            >
+                                <Icon name={isHidden ? "eye" : "eye-off"} className="w-4 h-4" />
+                            </button>
+                        </div>
+
+                        <div>
+                            <div className="flex justify-between items-start mb-4 pr-16 pl-1">
+                                <div className="flex items-start gap-3">
+                                    <div className="mt-1">
+                                        <Icon name={vehicle.isUnknown ? "help-circle" : "truck"} className={vehicle.isUnknown ? "text-indigo-500" : "text-slate-700"} />
+                                    </div>
+                                    <div>
+                                        {vehicle.Internreferens && (
+                                            <div className="text-lg font-extrabold text-slate-800 tracking-tight mb-1">
+                                                {vehicle.Internreferens}
+                                            </div>
+                                        )}
+                                        <h3 className={`${vehicle.Internreferens ? 'text-sm text-slate-500' : 'text-xl text-slate-800'} font-bold tracking-tight leading-none`}>{vehicle['Namn']}</h3>
+                                    </div>
+                                </div>
+                                <div className="flex gap-2">
+                                    <div className={`shrink-0 ${status === 'OK' ? 'text-green-600' : ''} ${status === 'WARNING' ? 'text-yellow-600' : ''} ${status === 'ERROR' ? 'text-red-600' : ''} ${status === 'INCOMPLETE' ? 'text-orange-500' : ''} ${status === 'MISSING' ? 'text-slate-400' : ''}`}>
+                                        <Icon name={iconName} className={`w-6 h-6 ${!currentCheck && postCheck ? 'animate-pulse' : ''}`} />
+                                    </div>
+                                    {(currentCheck || postCheck) && (
+                                        <div title={postCheck ? "Parkerad: Efter-kontroll inlämnad" : "Pass pågår: Inväntar Efter-kontroll"}>
+                                            <Icon name="parking" className={`w-6 h-6 ${parkingColor}`} />
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                            
+                            <div className="space-y-2 text-sm mt-3 pl-1">
+                                {displayCheck ? (
+                                    <>
+                                        <div className="flex items-center gap-2 text-slate-600">
+                                            <Icon name="user" className="w-4 h-4 shrink-0" />
+                                            <span className="truncate font-medium">{displayCheck['Respondent (read-only)'] || 'Okänd'}</span>
+                                        </div>
+                                        <div className="flex items-center justify-between text-slate-600">
+                                            <div className="flex items-center gap-2">
+                                                <Icon name="clock-4" className="w-4 h-4" />
+                                                <span>
+                                                    {displayCheck['Datum/tid'] ? displayCheck['Datum/tid'].split(' ')[1] : ''}
+                                                </span>
+                                            </div>
+                                            {checkData && checkData.all && checkData.all.length > 1 && (
+                                                <span className="bg-blue-100 text-blue-700 font-bold text-[10px] px-2 py-0.5 rounded-full uppercase tracking-wider">
+                                                    {checkData.all.length} st
+                                                </span>
+                                            )}
+                                        </div>
+                                        {displayTrailer && (
+                                            <div className="flex items-center gap-2 text-slate-600 mt-2">
+                                                <Icon name="trailer" className="w-4 h-4" />
+                                                <span className="truncate text-xs font-semibold bg-slate-100 border border-slate-200 px-2 py-0.5 rounded text-slate-700">{displayTrailer}</span>
+                                            </div>
+                                        )}
+                                    </>
+                                ) : (
+                                    <div className="text-slate-400 italic pt-2">
+                                        Inväntar tillsyn...
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+
+                        <div className={`mt-4 pt-3 border-t text-xs font-semibold tracking-wider leading-tight pl-1 flex items-center justify-between
+                            ${status === 'OK' ? 'border-green-200' : ''}
+                            ${status === 'WARNING' ? 'border-yellow-200' : ''}
+                            ${status === 'ERROR' ? 'border-red-200' : ''}
+                            ${status === 'INCOMPLETE' ? 'border-orange-200' : ''}
+                            ${status === 'MISSING' ? 'border-slate-100' : ''}
+                        `}>
+                            <div className={`uppercase ${status === 'OK' ? 'text-green-700' : ''} ${status === 'WARNING' ? 'text-yellow-700' : ''} ${status === 'ERROR' ? 'text-red-700' : ''} ${status === 'INCOMPLETE' ? 'text-orange-700' : ''} ${status === 'MISSING' ? 'text-slate-500' : ''}`}>
+                                {statusText}
+                            </div>
+                            
+                            {!vehicle.isUnknown && (
+                                <button 
+                                    onClick={(e) => handleOpenReport(e, vehicle, rawTrailer)}
+                                    className={`p-1.5 -mr-1.5 rounded-lg transition-colors focus:outline-none focus:ring-2
+                                        ${status === 'OK' ? 'text-green-600 hover:bg-green-100 hover:text-green-800' : ''}
+                                        ${status === 'WARNING' ? 'text-yellow-600 hover:bg-yellow-100 hover:text-yellow-800' : ''}
+                                        ${status === 'ERROR' ? 'text-red-600 hover:bg-red-100 hover:text-red-800' : ''}
+                                        ${status === 'INCOMPLETE' ? 'text-orange-600 hover:bg-orange-100 hover:text-orange-800' : ''}
+                                        ${status === 'MISSING' ? 'text-slate-400 hover:bg-slate-200 hover:text-slate-600' : ''}
+                                    `}
+                                    title="Visa felrapporter för valt ekipage"
+                                >
+                                    <Icon name="stethoscope" className="w-5 h-5" />
+                                </button>
+                            )}
+                        </div>
+                    </div>
+                );
+            };
+
+            const renderTVVehicleCard = (vehicle) => {
+                let checkData, currentCheck, status, postCheck, postStatus;
+
+                if (vehicle.isUnknown) {
+                    checkData = vehicle.checks;
+                    currentCheck = checkData.latest;
+                    status = analyzeCheckStatus(currentCheck);
+                    postCheck = vehicle.postChecks.latest;
+                    postStatus = analyzeCheckStatus(postCheck);
+                } else {
+                    checkData = getChecksForDate(vehicle['Namn']);
+                    currentCheck = checkData.latest;
+                    status = analyzeCheckStatus(currentCheck);
+                    postCheck = getPostCheckForPreCheck(currentCheck);
+                    postStatus = postCheck ? analyzeCheckStatus(postCheck) : null;
+
+                    if (!currentCheck) {
+                        const orphanedPostData = getOnlyPostChecksForDate(vehicle['Namn']);
+                        if (orphanedPostData.latest) {
+                            postCheck = orphanedPostData.latest;
+                            postStatus = analyzeCheckStatus(postCheck);
+                        }
+                    }
+                }
+                
+                const rawTrailer = currentCheck ? currentCheck['Regnr Släp'] : (postCheck ? postCheck['Regnr Släp'] : null);
+                const displayTrailer = formatTrailerDisplay(rawTrailer);
+                
+                let cardTheme = "bg-white border-slate-200 opacity-95";
+                let iconName = "clock";
+                let statusText = "Ej utförd idag";
+                let parkingColor = "text-slate-300 opacity-60"; 
+
+                if (currentCheck) {
+                    if (status === 'OK') { cardTheme = "bg-green-50 border-green-300"; iconName = "circle-check"; statusText = "Kontrollerad (OK)"; } 
+                    else if (status === 'WARNING') { cardTheme = "bg-yellow-50 border-yellow-400"; iconName = "triangle-alert"; statusText = "Egen åtgärd"; } 
+                    else if (status === 'ERROR') { cardTheme = "bg-red-50 border-red-400"; iconName = "circle-x"; statusText = "Rapporterat fel"; }
+                    else if (status === 'INCOMPLETE') { cardTheme = "bg-orange-50 border-orange-300"; iconName = "file-question"; statusText = "Ofullständig"; }
+                } else if (postCheck) {
+                    cardTheme = "bg-slate-50 border-red-400";
+                    iconName = "alert-triangle";
+                    statusText = "Saknar före-kontroll";
+                    status = "ERROR";
+                }
+
+                if (postCheck) {
+                    if (postStatus === 'OK') parkingColor = "text-green-500";
+                    if (postStatus === 'WARNING') parkingColor = "text-yellow-500";
+                    if (postStatus === 'ERROR') parkingColor = "text-red-500";
+                    if (postStatus === 'INCOMPLETE') parkingColor = "text-orange-500";
+                }
+
+                const displayCheck = currentCheck || postCheck;
+
+                return (
+                    <div key={vehicle['Namn']} className={`rounded-xl border p-3 shadow-sm flex flex-col justify-between h-full ${cardTheme} ${vehicle.isUnknown ? 'border-dashed border-2 border-indigo-300' : ''}`}>
+                        <div>
+                            <div className="flex justify-between items-start mb-2">
+                                <div className="flex items-start gap-2 overflow-hidden min-w-0">
+                                    <div className="mt-0.5 shrink-0">
+                                        <Icon name={vehicle.isUnknown ? "help-circle" : "truck"} className={vehicle.isUnknown ? "text-indigo-500 w-4 h-4" : "text-slate-700 w-4 h-4"} />
+                                    </div>
+                                    <div className="min-w-0 flex-1">
+                                        {vehicle.Internreferens && (
+                                            <div className="text-sm font-extrabold text-slate-800 tracking-tight leading-none mb-0.5 truncate" title={vehicle.Internreferens}>
+                                                {vehicle.Internreferens}
+                                            </div>
+                                        )}
+                                        <div className={`${vehicle.Internreferens ? 'text-[10px] text-slate-500' : 'text-sm font-bold text-slate-800'} tracking-tight leading-none truncate`} title={vehicle['Namn']}>
+                                            {vehicle['Namn']}
+                                        </div>
+                                    </div>
+                                </div>
+                                <div className="flex gap-1.5 shrink-0 ml-1.5">
+                                    <div className={`shrink-0 ${status === 'OK' ? 'text-green-600' : ''} ${status === 'WARNING' ? 'text-yellow-600' : ''} ${status === 'ERROR' ? 'text-red-600' : ''} ${status === 'INCOMPLETE' ? 'text-orange-500' : ''} ${status === 'MISSING' ? 'text-slate-400' : ''}`}>
+                                        <Icon name={iconName} className={`w-5 h-5 ${!currentCheck && postCheck ? 'animate-pulse' : ''}`} />
+                                    </div>
+                                    {(currentCheck || postCheck) && (
+                                        <Icon name="parking" className={`w-5 h-5 ${parkingColor}`} />
+                                    )}
+                                </div>
+                            </div>
+                            
+                            <div className="space-y-1.5 text-[11px] mt-2 pl-0.5">
+                                {displayCheck ? (
+                                    <>
+                                        <div className="flex items-center gap-1.5 text-slate-600">
+                                            <Icon name="user" className="w-3 h-3 shrink-0" />
+                                            <span className="truncate font-medium">{displayCheck['Respondent (read-only)'] || 'Okänd'}</span>
+                                        </div>
+                                        <div className="flex items-center justify-between text-slate-600">
+                                            <div className="flex items-center gap-1.5">
+                                                <Icon name="clock-4" className="w-3 h-3 shrink-0" />
+                                                <span className="font-medium">
+                                                    {displayCheck['Datum/tid'] ? displayCheck['Datum/tid'].split(' ')[1] : ''}
+                                                </span>
+                                            </div>
+                                        </div>
+                                        {displayTrailer && (
+                                            <div className="flex items-center gap-1.5 text-slate-600 mt-1">
+                                                <Icon name="trailer" className="w-3 h-3 shrink-0" />
+                                                <span className="truncate text-[9px] font-bold bg-slate-100/80 border border-slate-200 px-1.5 py-0.5 rounded text-slate-700">{displayTrailer}</span>
+                                            </div>
+                                        )}
+                                    </>
+                                ) : (
+                                    <div className="text-slate-400 italic pt-0.5 pb-2">
+                                        Inväntar tillsyn...
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+
+                        <div className={`mt-2.5 pt-1.5 border-t text-[9px] font-bold uppercase tracking-wider leading-tight pl-0.5
+                            ${status === 'OK' ? 'border-green-300 text-green-700' : ''}
+                            ${status === 'WARNING' ? 'border-yellow-300 text-yellow-700' : ''}
+                            ${status === 'ERROR' ? 'border-red-300 text-red-700' : ''}
+                            ${status === 'INCOMPLETE' ? 'border-orange-300 text-orange-700' : ''}
+                            ${status === 'MISSING' ? 'border-slate-100 text-slate-500' : ''}
+                        `}>
+                            {statusText}
+                        </div>
+                    </div>
+                );
+            };
+
+            // Beräkna alla TV-sidor (slides) dynamiskt
+            const tvSlides = React.useMemo(() => {
+                const slides = [];
+                const tvDeps = tvSettings.departments.length > 0 ? sortedDepartments.filter(d => tvSettings.departments.includes(d)) : sortedDepartments;
+
+                tvDeps.forEach(dep => {
+                    const isCustom = customDeps.hasOwnProperty(dep);
+                    const isUnknown = dep === 'Okända fordon';
+                    
+                    let depVehicles = [];
+                    if (isUnknown) depVehicles = unknownVehicles;
+                    else if (isCustom) depVehicles = vehicles.filter(v => customDeps[dep].includes(v['Namn']));
+                    else depVehicles = vehicles.filter(v => v.Avdelning === dep && !hiddenVehicles.includes(v['Namn']));
+                    
+                    let sortedDepVehicles = [...depVehicles];
+                    if (sortMethod === 'internref') {
+                        sortedDepVehicles.sort((a, b) => String(a.Internreferens || a['Namn']).toLowerCase().localeCompare(String(b.Internreferens || b['Namn']).toLowerCase(), 'sv'));
+                    } else if (sortMethod === 'regnr') {
+                        sortedDepVehicles.sort((a, b) => String(a['Namn']).toLowerCase().localeCompare(String(b['Namn']).toLowerCase(), 'sv'));
+                    } else {
+                        if (customOrder.length > 0 && !isUnknown) {
+                            sortedDepVehicles.sort((a, b) => {
+                                const idxA = customOrder.indexOf(a['Namn']);
+                                const idxB = customOrder.indexOf(b['Namn']);
+                                if (idxA !== -1 && idxB !== -1) return idxA - idxB;
+                                if (idxA !== -1) return -1; if (idxB !== -1) return 1;
+                                return 0;
+                            });
+                        }
+                    }
+
+                    if (sortedDepVehicles.length === 0) return;
+
+                    const max = tvSettings.maxPerPage || 24;
+                    const totalPages = Math.ceil(sortedDepVehicles.length / max);
+
+                    for (let i = 0; i < totalPages; i++) {
+                        slides.push({
+                            id: `${dep}-page-${i+1}`,
+                            depName: dep,
+                            isCustom,
+                            isUnknown,
+                            pageIndex: i + 1,
+                            totalPages,
+                            vehicles: sortedDepVehicles.slice(i * max, (i + 1) * max)
+                        });
+                    }
+                });
+                return slides;
+            }, [tvSettings, sortedDepartments, customDeps, unknownVehicles, vehicles, hiddenVehicles, customOrder, sortMethod]);
+
+            // Återställ slide om avdelningar ändras och nuvarande index blir ogiltigt
+            React.useEffect(() => {
+                if (currentSlideIndex >= tvSlides.length && tvSlides.length > 0) {
+                    setCurrentSlideIndex(0);
+                }
+            }, [tvSlides.length, currentSlideIndex]);
+
+            // Timer för TV-karusell
+            React.useEffect(() => {
+                if (currentView !== 'tv' || tvSlides.length <= 1 || !tvSettings.carouselSpeed || tvSettings.carouselSpeed === 0) return;
+                
+                const timer = setInterval(() => {
+                    setCurrentSlideIndex(prev => (prev + 1) % tvSlides.length);
+                }, tvSettings.carouselSpeed * 1000);
+
+                return () => clearInterval(timer);
+            }, [currentView, tvSlides.length, tvSettings.carouselSpeed]);
+
+            const nextTvSlide = () => setCurrentSlideIndex(prev => (prev + 1) % tvSlides.length);
+            const prevTvSlide = () => setCurrentSlideIndex(prev => (prev - 1 + tvSlides.length) % tvSlides.length);
+
+            // ==========================================
+            // RAPPORTER / STATISTIK VY
+            // ==========================================
+            const renderReports = () => {
+                const baseActiveVehicles = vehicles.filter(v => {
+                    if(hiddenVehicles.includes(v['Namn'])) return false;
+                    if(reportDepartments.length === 0) return true;
+                    return reportDepartments.includes(v.Avdelning);
+                });
+                const totalActiveVehiclesCount = baseActiveVehicles.length;
+
+                const isRelevantForDept = (regnrStr) => {
+                    if (reportDepartments.length === 0) return true;
+                    const vObj = findVehicleByAnyReference(regnrStr);
+                    if (vObj && reportDepartments.includes(vObj.Avdelning)) return true;
+                    return false;
+                };
+
+                const filteredPre = reportChecks.filter(c => isRelevantForDept(String(c['Regnr Bil'] || '')));
+                const filteredPost = reportPostChecks.filter(c => isRelevantForDept(String(c['Regnr Bil'] || '')));
+
+                const totalPre = filteredPre.length;
+                const totalPost = filteredPost.length;
+                const totalChecks = totalPre + totalPost;
+
+                let warningCount = 0; 
+                let errorCount = 0;   
+                let incompleteCount = 0; 
+
+                const isComplete = (c) => analyzeCheckStatus(c) !== 'INCOMPLETE';
+
+                const uniqueCheckedSet = new Set([
+                    ...filteredPre.filter(isComplete).map(c => normalizeRegNr(c['Regnr Bil'])),
+                    ...filteredPost.filter(isComplete).map(c => normalizeRegNr(c['Regnr Bil']))
+                ]);
+                const uniqueVehiclesCount = uniqueCheckedSet.size;
+
+                const compliancePct = totalActiveVehiclesCount > 0 ? Math.round((uniqueVehiclesCount / totalActiveVehiclesCount) * 100) : 0;
+
+                const analyzeDefects = () => {
+                    const defects = {}; 
+                    const processCheck = (check) => {
+                        const st = analyzeCheckStatus(check);
+                        if (st === 'WARNING') warningCount++;
+                        if (st === 'ERROR') errorCount++;
+                        if (st === 'INCOMPLETE') incompleteCount++;
+
+                        for (const key in check) {
+                            if (['Datum/tid', 'Regnr Bil', 'Regnr Släp', 'Respondent (read-only)', 'Skapat (read-only)', 'Senast ändrat (read-only)', 'Formulärsvar ID (read-only)'].includes(key)) continue;
+                            const ans = String(check[key]).trim();
+                            if (ans) {
+                                const f = ans.charAt(0);
+                                if (f === '2' || f === '3') {
+                                    const short = shortenQuestion(key);
+                                    if (!defects[short]) defects[short] = { warning: 0, error: 0 };
+                                    if (f === '2') defects[short].warning++;
+                                    if (f === '3') defects[short].error++;
+                                }
+                            }
+                        }
+                    };
+                    filteredPre.forEach(processCheck);
+                    filteredPost.forEach(processCheck);
+                    
+                    return Object.entries(defects)
+                        .map(([name, counts]) => ({ name, ...counts, total: counts.warning + counts.error }))
+                        .sort((a, b) => b.total - a.total);
+                };
+
+                const topDefects = analyzeDefects();
+                const errorRatio = totalChecks > 0 ? Math.round((errorCount / totalChecks) * 100) : 0;
+                const warningRatio = totalChecks > 0 ? Math.round((warningCount / totalChecks) * 100) : 0;
+
+                const healthIndex = Math.round(compliancePct * (1 - (errorCount / Math.max(1, totalChecks))));
+
+                const analyzeTrend = () => {
+                    const days = {};
+                    const process = (c, type) => {
+                        const dateStr = String(c['Datum/tid'] || '').split(' ')[0];
+                        if(!dateStr || dateStr.length < 10) return;
+                        if(!days[dateStr]) days[dateStr] = { pre: 0, post: 0 };
+                        days[dateStr][type]++;
+                    };
+                    filteredPre.forEach(c => process(c, 'pre'));
+                    filteredPost.forEach(c => process(c, 'post'));
+                    
+                    return Object.entries(days)
+                        .map(([date, counts]) => ({ date, ...counts }))
+                        .sort((a, b) => a.date.localeCompare(b.date)); 
+                };
+                const trendData = analyzeTrend();
+                const maxTrendVal = Math.max(...trendData.map(d => Math.max(d.pre, d.post)), 1);
+
+                const buildSvgPoints = (type) => {
+                    if (trendData.length === 0) return "";
+                    const width = 960; const offsetX = 40;
+                    const xStep = width / Math.max(1, trendData.length - 1);
+                    return trendData.map((d, i) => {
+                        const x = offsetX + i * xStep;
+                        const y = 150 - ((d[type] / maxTrendVal) * 100);
+                        return `${x},${y}`;
+                    }).join(" ");
+                };
+                const prePoints = buildSvgPoints('pre');
+                const postPoints = buildSvgPoints('post');
+
+                const analyzeTimeOfDay = () => {
+                    const hours = Array.from({length: 24}, (_, i) => ({ hour: i, pre: 0, post: 0 }));
+                    const process = (c, type) => {
+                        const timeStr = String(c['Datum/tid'] || '').split(' ')[1];
+                        if(!timeStr) return;
+                        const h = parseInt(timeStr.split(':')[0], 10);
+                        if(!isNaN(h) && h >= 0 && h < 24) hours[h][type]++;
+                    };
+                    filteredPre.forEach(c => process(c, 'pre'));
+                    filteredPost.forEach(c => process(c, 'post'));
+                    return hours;
+                };
+                const timeData = analyzeTimeOfDay();
+                const maxTimeVal = Math.max(...timeData.map(d => Math.max(d.pre, d.post)), 1);
+
+                const analyzeErrorVehicles = () => {
+                    const vehi = {}; 
+                    const process = (c) => {
+                        const reg = normalizeRegNr(c['Regnr Bil'] || 'Okänd');
+                        const st = analyzeCheckStatus(c);
+                        if(!vehi[reg]) {
+                            const vObj = findVehicleByAnyReference(reg);
+                            vehi[reg] = { display: vObj && vObj.Internreferens ? `${vObj.Internreferens} (${reg})` : reg, errors: 0 };
+                        }
+                        if(st === 'ERROR') vehi[reg].errors++;
+                    };
+                    filteredPre.forEach(process); filteredPost.forEach(process);
+                    return Object.entries(vehi).map(([reg, data]) => ({ reg, ...data })).filter(v => v.errors > 0).sort((a, b) => b.errors - a.errors);
+                };
+                const topErrorVehicles = analyzeErrorVehicles().slice(0, 10);
+
+                const unusedVehicles = baseActiveVehicles.filter(v => !uniqueCheckedSet.has(normalizeRegNr(v['Namn'])));
+
+                const analyzeDrivers = () => {
+                    const drivers = {};
+                    const process = (c) => {
+                        let name = String(c['Respondent (read-only)'] || 'Okänd').trim();
+                        if(name.length > 0) name = name.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
+                        const st = analyzeCheckStatus(c);
+                        if(!drivers[name]) drivers[name] = { total: 0, warnings: 0 };
+                        drivers[name].total++;
+                        if(st === 'WARNING') drivers[name].warnings++;
+                    };
+                    filteredPre.forEach(process); filteredPost.forEach(process);
+                    return Object.entries(drivers).map(([name, counts]) => ({ name, ...counts }));
+                };
+                const driverStats = analyzeDrivers();
+                const topDiligentDrivers = [...driverStats].sort((a, b) => b.total - a.total).slice(0, 10);
+                const topProactiveDrivers = [...driverStats].sort((a, b) => b.warnings - a.warnings).slice(0, 10);
+
+                const detectTickAndGo = () => {
+                    const vStats = {}; 
+                    const process = (c) => {
+                        const reg = normalizeRegNr(c['Regnr Bil'] || 'Okänd');
+                        let driver = String(c['Respondent (read-only)'] || 'Okänd').trim();
+                        if(driver.length > 0) driver = driver.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
+                        const st = analyzeCheckStatus(c);
+                        const hasDefect = (st === 'WARNING' || st === 'ERROR') ? 1 : 0;
+
+                        if(!vStats[reg]) vStats[reg] = { totalChecks: 0, defects: 0, drivers: {} };
+                        if(!vStats[reg].drivers[driver]) vStats[reg].drivers[driver] = { checks: 0, defects: 0 };
+                        
+                        vStats[reg].totalChecks++;
+                        vStats[reg].defects += hasDefect;
+                        vStats[reg].drivers[driver].checks++;
+                        vStats[reg].drivers[driver].defects += hasDefect;
+                    };
+                    filteredPre.forEach(process); filteredPost.forEach(process);
+
+                    const insights = [];
+                    Object.entries(vStats).forEach(([reg, stat]) => {
+                        if (Object.keys(stat.drivers).length > 1 && stat.defects > 0) {
+                            const avgDefectRate = stat.defects / stat.totalChecks;
+                            if (avgDefectRate >= 0.15) { 
+                                Object.entries(stat.drivers).forEach(([drvName, drvStat]) => {
+                                    if (drvStat.checks >= 3 && drvStat.defects === 0) {
+                                        const vObj = findVehicleByAnyReference(reg);
+                                        insights.push({
+                                            driver: drvName, checks: drvStat.checks, 
+                                            vehicle: vObj && vObj.Internreferens ? `${vObj.Internreferens} (${reg})` : reg,
+                                            avgRate: Math.round(avgDefectRate * 100)
+                                        });
+                                    }
+                                });
+                            }
+                        }
+                    });
+                    return insights;
+                };
+                const smartInsights = detectTickAndGo();
+
+                const getDeptStats = () => {
+                    return departments.map(dep => {
+                        const depVehicles = vehicles.filter(v => v.Avdelning === dep && !hiddenVehicles.includes(v['Namn']));
+                        const depChecks = [...reportChecks, ...reportPostChecks].filter(c => {
+                            const v = findVehicleByAnyReference(String(c['Regnr Bil'] || ''));
+                            return v && v.Avdelning === dep;
+                        });
+                        const unqChecked = new Set(depChecks.map(c => normalizeRegNr(c['Regnr Bil']))).size;
+                        const depCompl = depVehicles.length > 0 ? Math.round((unqChecked / depVehicles.length) * 100) : 0;
+                        
+                        let depErrors = 0;
+                        depChecks.forEach(c => { if(analyzeCheckStatus(c) === 'ERROR') depErrors++; });
+                        const depHindex = Math.round(depCompl * (1 - (depErrors / Math.max(1, depChecks.length))));
+                        
+                        return { name: dep, compliance: depCompl, health: depHindex };
+                    }).sort((a,b) => b.health - a.health);
+                };
+                const deptStats = reportDepartments.length === 0 ? getDeptStats() : [];
+
+                const renderRadarChart = () => {
+                    const radarData = topDefects.slice(0, 6);
+                    if (radarData.length < 3) return null; 
+                    
+                    const maxVal = Math.max(...radarData.map(d => d.total), 1);
+                    const cx = 150; const cy = 140; const r = 85;
+                    const points = radarData.map((d, i) => {
+                        const angle = (Math.PI / 2) - (i * 2 * Math.PI / radarData.length);
+                        const valR = (d.total / maxVal) * r;
+                        return {
+                            x: cx + valR * Math.cos(angle),
+                            y: cy - valR * Math.sin(angle),
+                            labelX: cx + (r + 25) * Math.cos(angle),
+                            labelY: cy - (r + 20) * Math.sin(angle),
+                            name: d.name,
+                            val: d.total
+                        };
+                    });
+                    const polyPoints = points.map(p => `${p.x},${p.y}`).join(' ');
+                    
+                    return (
+                        <div className="mb-6 flex justify-center">
+                            <svg viewBox="0 0 300 280" className="w-full max-w-[320px] h-auto">
+                                {[0.25, 0.5, 0.75, 1].map(level => {
+                                    const bgPoints = radarData.map((_, i) => {
+                                        const angle = (Math.PI / 2) - (i * 2 * Math.PI / radarData.length);
+                                        return `${cx + (r * level) * Math.cos(angle)},${cy - (r * level) * Math.sin(angle)}`;
+                                    }).join(' ');
+                                    return <polygon key={level} points={bgPoints} fill="none" stroke="#e2e8f0" strokeWidth="1" />
+                                })}
+                                {radarData.map((_, i) => {
+                                    const angle = (Math.PI / 2) - (i * 2 * Math.PI / radarData.length);
+                                    return <line key={`l${i}`} x1={cx} y1={cy} x2={cx + r * Math.cos(angle)} y2={cy - r * Math.sin(angle)} stroke="#e2e8f0" strokeWidth="1" />
+                                })}
+                                <polygon points={polyPoints} fill="rgba(59, 130, 246, 0.3)" stroke="#3b82f6" strokeWidth="2" />
+                                {points.map((p, i) => (
+                                    <g key={`p${i}`}>
+                                        <circle cx={p.x} cy={p.y} r="4" fill="#3b82f6" />
+                                        <text x={p.labelX} y={p.labelY} fontSize="11" fill="#475569" fontWeight="bold" textAnchor="middle" alignmentBaseline="middle">
+                                            {p.name.length > 15 ? p.name.substring(0,13)+'..' : p.name}
+                                        </text>
+                                        <text x={p.labelX} y={p.labelY + 12} fontSize="10" fill="#94a3b8" textAnchor="middle" alignmentBaseline="middle">
+                                            {p.val} st
+                                        </text>
+                                    </g>
+                                ))}
+                            </svg>
+                        </div>
+                    );
+                };
+
+                return (
+                    <div className="max-w-[1600px] mx-auto relative p-4 md:p-8 print:p-0">
+                        {/* Header Rapporter */}
+                        <div className="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4 mb-6 no-print">
+                            <div className="flex items-center gap-4">
+                                <button onClick={() => setCurrentView('overview')} className="p-2.5 bg-white border border-slate-200 rounded-xl hover:bg-slate-50 transition-colors text-slate-500 hover:text-blue-600">
+                                    <Icon name="arrow-left" className="w-6 h-6" />
+                                </button>
+                                <div>
+                                    <h1 className="text-3xl font-bold text-slate-800 flex items-center gap-3">
+                                        <Icon name="bar-chart-3" className="text-blue-600 w-8 h-8" />
+                                        Statistik & Rapporter
+                                    </h1>
+                                </div>
+                            </div>
+                            <div className="flex flex-wrap items-center gap-3 bg-white p-2 rounded-xl shadow-sm border border-slate-200 w-full lg:w-auto">
+                                
+                                <div className="relative">
+                                    <button 
+                                        onClick={() => setReportDepOpen(!reportDepOpen)} 
+                                        className="flex items-center gap-2 px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-slate-700 font-bold focus:outline-none cursor-pointer"
+                                    >
+                                        <Icon name="layers" className="w-5 h-5 text-slate-500" />
+                                        {reportDepartments.length === 0 ? "Alla avdelningar" : `${reportDepartments.length} valda`}
+                                    </button>
+                                    {reportDepOpen && (
+                                        <>
+                                            <div className="fixed inset-0 z-10" onClick={() => setReportDepOpen(false)}></div>
+                                            <div className="absolute top-full left-0 mt-1 w-64 bg-white border border-slate-200 shadow-xl rounded-xl z-20 p-2 max-h-96 overflow-y-auto">
+                                                <label className="flex items-center gap-3 p-2 hover:bg-slate-50 rounded-lg cursor-pointer">
+                                                    <input 
+                                                        type="checkbox" 
+                                                        checked={reportDepartments.length === 0} 
+                                                        onChange={() => setReportDepartments([])} 
+                                                        className="w-4 h-4 text-blue-600 rounded border-slate-300 focus:ring-blue-500" 
+                                                    />
+                                                    <span className="text-sm font-medium text-slate-700">Visa alla avdelningar</span>
+                                                </label>
+                                                <div className="h-px bg-slate-100 my-1"></div>
+                                                {departments.map(d => (
+                                                    <label key={d} className="flex items-center gap-3 p-2 hover:bg-slate-50 rounded-lg cursor-pointer">
+                                                        <input 
+                                                            type="checkbox" 
+                                                            checked={reportDepartments.includes(d)} 
+                                                            onChange={(e) => {
+                                                                setReportDepartments(prev => 
+                                                                    prev.includes(d) ? prev.filter(x => x !== d) : [...prev, d]
+                                                                );
+                                                            }} 
+                                                            className="w-4 h-4 text-blue-600 rounded border-slate-300 focus:ring-blue-500" 
+                                                        />
+                                                        <span className="text-sm text-slate-700 font-medium truncate">{d}</span>
+                                                    </label>
+                                                ))}
+                                            </div>
+                                        </>
+                                    )}
+                                </div>
+
+                                <div className="h-6 w-px bg-slate-200 mx-1"></div>
+                                <div className="flex items-center gap-2 px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg">
+                                    <Icon name="calendar" className="w-5 h-5 text-slate-500" />
+                                    <select value={reportPeriod} onChange={(e) => setReportPeriod(e.target.value)} className="bg-transparent border-none text-slate-700 font-medium focus:outline-none focus:ring-0 cursor-pointer">
+                                        <option value="7days">Senaste 7 dagarna</option>
+                                        <option value="thisMonth">Denna månad</option>
+                                        <option value="lastMonth">Föregående månad</option>
+                                        <option value="ytd">Hittills i år</option>
+                                        <option value="custom">Eget datumval...</option>
+                                    </select>
+                                </div>
+                                {reportPeriod === 'custom' && (
+                                    <div className="flex items-center gap-2 px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg">
+                                        <input type="date" value={customReportStart} onChange={e=>setCustomReportStart(e.target.value)} className="bg-transparent border-none text-sm text-slate-700 font-medium focus:outline-none" />
+                                        <span className="text-slate-400">-</span>
+                                        <input type="date" value={customReportEnd} onChange={e=>setCustomReportEnd(e.target.value)} className="bg-transparent border-none text-sm text-slate-700 font-medium focus:outline-none" />
+                                    </div>
+                                )}
+                                <button onClick={() => window.print()} className="flex items-center gap-2 px-4 py-2 bg-slate-800 text-white rounded-lg font-medium shadow-sm transition-all hover:bg-slate-900" title="Skriver ut den flik du tittar på nu">
+                                    <Icon name="printer" className="w-4 h-4" /> Exportera PDF
+                                </button>
+                            </div>
+                        </div>
+
+                        {/* Flik-navigering */}
+                        <div className="flex overflow-x-auto gap-2 mb-8 border-b border-slate-200 no-print">
+                            <button onClick={()=>setReportTab('overview')} className={`px-4 py-3 font-bold text-sm border-b-2 transition-colors whitespace-nowrap flex items-center gap-2 ${reportTab==='overview'?'border-blue-600 text-blue-700':'border-transparent text-slate-500 hover:text-slate-700'}`}>
+                                <Icon name="layout-dashboard" className="w-4 h-4"/> Översikt
+                            </button>
+                            <button onClick={()=>setReportTab('workshop')} className={`px-4 py-3 font-bold text-sm border-b-2 transition-colors whitespace-nowrap flex items-center gap-2 ${reportTab==='workshop'?'border-blue-600 text-blue-700':'border-transparent text-slate-500 hover:text-slate-700'}`}>
+                                <Icon name="wrench" className="w-4 h-4"/> Fordon & Kvalitet (Verkstad)
+                            </button>
+                            <button onClick={()=>setReportTab('hr')} className={`px-4 py-3 font-bold text-sm border-b-2 transition-colors whitespace-nowrap flex items-center gap-2 ${reportTab==='hr'?'border-blue-600 text-blue-700':'border-transparent text-slate-500 hover:text-slate-700'}`}>
+                                <Icon name="users" className="w-4 h-4"/> Chaufförer & Beteende (Personal)
+                            </button>
+                            {reportDepartments.length === 0 && (
+                                <button onClick={()=>setReportTab('compare')} className={`px-4 py-3 font-bold text-sm border-b-2 transition-colors whitespace-nowrap flex items-center gap-2 ${reportTab==='compare'?'border-blue-600 text-blue-700':'border-transparent text-slate-500 hover:text-slate-700'}`}>
+                                    <Icon name="bar-chart-horizontal" className="w-4 h-4"/> Avdelningsjämförelse
+                                </button>
+                            )}
+                        </div>
+
+                        {/* Print Header (Syns bara i PDF) */}
+                        <div className="hidden print-only mb-8 border-b border-slate-200 pb-4">
+                            <h1 className="text-3xl font-bold text-slate-800 mb-2">Statistikrapport: Daglig Tillsyn</h1>
+                            <div className="flex gap-6 text-sm text-slate-600 font-bold">
+                                <span>Avdelning: {reportDepartments.length === 0 ? 'Alla avdelningar' : reportDepartments.join(', ')}</span>
+                                <span>Period: {reportPeriod === 'custom' ? `${customReportStart} - ${customReportEnd}` : reportPeriod}</span>
+                                <span className="ml-auto">Utskriven: {new Date().toLocaleDateString('sv-SE')}</span>
+                            </div>
+                        </div>
+
+                        {loadingReport ? (
+                            <div className="text-center py-20 text-slate-400 no-print">
+                                <Icon name="loader-2" className="animate-spin w-12 h-12 mx-auto mb-4" />
+                                <p className="font-semibold text-lg">Hämtar och beräknar data från Colix...</p>
+                            </div>
+                        ) : totalChecks === 0 ? (
+                            <div className="text-center py-20 bg-white rounded-2xl border border-slate-200 shadow-sm no-print">
+                                <Icon name="bar-chart-3" className="w-16 h-16 text-slate-300 mx-auto mb-4" />
+                                <h2 className="text-xl font-bold text-slate-600 mb-1">Ingen data hittades</h2>
+                                <p className="text-slate-500">Det finns inga registrerade kontroller för den valda avdelningen/perioden.</p>
+                            </div>
+                        ) : (
+                            <div className="print-section">
+                                
+                                {/* --- FLIK 1: ÖVERSIKT --- */}
+                                <div className={reportTab === 'overview' ? 'block' : 'hidden print:hidden'}>
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                                        <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm print-break-inside-avoid">
+                                            <h3 className="text-slate-500 font-bold text-xs uppercase tracking-wider mb-2">Totala Kontroller</h3>
+                                            <div className="text-4xl font-black text-slate-800 mb-2">{totalChecks.toLocaleString('sv-SE')}</div>
+                                            <div className="flex gap-3 text-xs font-bold text-slate-400">
+                                                <span className="flex items-center gap-1"><Icon name="truck" className="w-3 h-3"/> {totalPre} före</span>
+                                                <span className="flex items-center gap-1"><Icon name="parking" className="w-3 h-3"/> {totalPost} efter</span>
+                                            </div>
+                                        </div>
+                                        <div className={`bg-white p-5 rounded-2xl border shadow-sm print-break-inside-avoid ${compliancePct >= 90 ? 'border-green-300' : (compliancePct >= 70 ? 'border-yellow-300' : 'border-red-300')}`}>
+                                            <h3 className="text-slate-500 font-bold text-xs uppercase tracking-wider mb-2">Slutförandegrad</h3>
+                                            <div className={`text-4xl font-black mb-1 ${compliancePct >= 90 ? 'text-green-600' : (compliancePct >= 70 ? 'text-yellow-600' : 'text-red-600')}`}>{compliancePct}%</div>
+                                            <div className="text-xs font-medium text-slate-500 leading-tight">Andel av avdelningens aktiva fordon som kontrollerats.</div>
+                                        </div>
+                                        <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm print-break-inside-avoid">
+                                            <h3 className="text-slate-500 font-bold text-xs uppercase tracking-wider mb-2">Fordonsstatus</h3>
+                                            <div className="text-4xl font-black text-red-600 mb-1">{errorRatio}% <span className="text-lg font-bold text-slate-500">Rapporterade fel</span></div>
+                                            <div className="text-xs font-bold text-yellow-600 flex items-center gap-1"><Icon name="check-circle" className="w-3 h-3"/> {warningRatio}% löstes direkt av chaufför</div>
+                                        </div>
+                                        <div className={`p-5 rounded-2xl border shadow-sm print-break-inside-avoid ${healthIndex >= 90 ? 'bg-gradient-to-br from-blue-600 to-indigo-700 border-blue-800 text-white' : 'bg-white border-slate-200 text-slate-800'}`}>
+                                            <h3 className={`font-bold text-xs uppercase tracking-wider mb-2 ${healthIndex >= 90 ? 'text-blue-200' : 'text-slate-500'}`}>Helhets-index</h3>
+                                            <div className="text-5xl font-black mb-1">{healthIndex} <span className="text-lg font-bold opacity-60">/ 100</span></div>
+                                            <div className={`text-xs font-medium leading-tight ${healthIndex >= 90 ? 'text-blue-100' : 'text-slate-500'}`}>Mäter slutförandegrad kontra rena fel. Gula åtgärder straffar ej indexet.</div>
+                                        </div>
+                                    </div>
+
+                                    <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm print-break-inside-avoid">
+                                        <div className="flex justify-between items-center mb-6">
+                                            <h3 className="font-bold text-lg text-slate-800">Trend över tid (Kontroller)</h3>
+                                            <div className="flex gap-4 text-xs font-bold text-slate-500">
+                                                <span className="flex items-center gap-1"><div className="w-3 h-1 bg-blue-500 rounded-full"></div> Före</span>
+                                                <span className="flex items-center gap-1"><div className="w-3 h-1 bg-indigo-500 rounded-full"></div> Efter</span>
+                                            </div>
+                                        </div>
+                                        {trendData.length > 1 ? (
+                                            <div className="relative w-full h-64 pt-4 border-b border-slate-200">
+                                                <svg viewBox="0 0 1000 200" className="w-full h-full overflow-visible" preserveAspectRatio="none">
+                                                    {/* Stödlinjer */}
+                                                    <line x1="35" y1="50" x2="1000" y2="50" stroke="#f1f5f9" strokeWidth="1" />
+                                                    <line x1="35" y1="100" x2="1000" y2="100" stroke="#f1f5f9" strokeWidth="1" />
+                                                    <line x1="35" y1="150" x2="1000" y2="150" stroke="#f1f5f9" strokeWidth="1" />
+                                                    
+                                                    {/* Y-axis Skala */}
+                                                    <text x="0" y="54" fontSize="11" fill="#94a3b8" fontWeight="bold">{Math.round(maxTrendVal)}</text>
+                                                    <text x="0" y="104" fontSize="11" fill="#94a3b8" fontWeight="bold">{Math.round(maxTrendVal/2)}</text>
+                                                    <text x="0" y="154" fontSize="11" fill="#94a3b8" fontWeight="bold">0</text>
+                                                    
+                                                    {/* Data linjer */}
+                                                    <polyline points={prePoints} fill="none" stroke="#3b82f6" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" />
+                                                    <polyline points={postPoints} fill="none" stroke="#6366f1" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" />
+                                                    
+                                                    {/* Punkter (cirklar) */}
+                                                    {trendData.map((d, i) => {
+                                                        const x = 40 + i * (960 / Math.max(1, trendData.length - 1));
+                                                        return (
+                                                            <g key={i}>
+                                                                <circle cx={x} cy={150 - ((d.pre / maxTrendVal) * 100)} r="5" fill="#fff" stroke="#3b82f6" strokeWidth="2" className="cursor-crosshair hover:r-[7px] transition-all">
+                                                                    <title>{d.date}&#10;Före-kontroller: {d.pre} st</title>
+                                                                </circle>
+                                                                <circle cx={x} cy={150 - ((d.post / maxTrendVal) * 100)} r="5" fill="#fff" stroke="#6366f1" strokeWidth="2" className="cursor-crosshair hover:r-[7px] transition-all">
+                                                                    <title>{d.date}&#10;Efter-kontroller: {d.post} st</title>
+                                                                </circle>
+                                                            </g>
+                                                        );
+                                                    })}
+                                                </svg>
+                                                <div className="flex justify-between mt-3 text-[10px] text-slate-400 font-bold uppercase tracking-wider px-1 ml-10">
+                                                    <span>{trendData[0].date.substring(5)}</span>
+                                                    {trendData.length > 2 && <span>{trendData[Math.floor(trendData.length/2)].date.substring(5)}</span>}
+                                                    <span>{trendData[trendData.length-1].date.substring(5)}</span>
+                                                </div>
+                                            </div>
+                                        ) : (
+                                            <p className="text-sm text-slate-400 italic">Behövs fler dagar för att rita en trend.</p>
+                                        )}
+                                    </div>
+                                    
+                                    {/* NYTT: Diagram över tid på dygnet */}
+                                    <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm mt-6 print-break-inside-avoid">
+                                        <div className="flex justify-between items-center mb-6">
+                                            <h3 className="font-bold text-lg text-slate-800">Tidpunkt för kontroller (Dygnets timmar)</h3>
+                                            <div className="flex gap-4 text-xs font-bold text-slate-500">
+                                                <span className="flex items-center gap-1"><div className="w-3 h-3 bg-blue-500 rounded-sm"></div> Före</span>
+                                                <span className="flex items-center gap-1"><div className="w-3 h-3 bg-indigo-500 rounded-sm"></div> Efter</span>
+                                            </div>
+                                        </div>
+                                        <div className="relative w-full h-48 pt-4">
+                                            <svg viewBox="0 0 1000 200" className="w-full h-full overflow-visible" preserveAspectRatio="none">
+                                                <line x1="35" y1="50" x2="1000" y2="50" stroke="#f1f5f9" strokeWidth="1" />
+                                                <line x1="35" y1="100" x2="1000" y2="100" stroke="#f1f5f9" strokeWidth="1" />
+                                                <line x1="35" y1="150" x2="1000" y2="150" stroke="#f1f5f9" strokeWidth="1" />
+                                                
+                                                <text x="0" y="54" fontSize="11" fill="#94a3b8" fontWeight="bold">{Math.round(maxTimeVal)}</text>
+                                                <text x="0" y="104" fontSize="11" fill="#94a3b8" fontWeight="bold">{Math.round(maxTimeVal/2)}</text>
+                                                <text x="0" y="154" fontSize="11" fill="#94a3b8" fontWeight="bold">0</text>
+                                                
+                                                {timeData.map((d, i) => {
+                                                    const x = 40 + i * (960 / 24);
+                                                    const w = (960 / 24) * 0.35;
+                                                    const hPre = (d.pre / maxTimeVal) * 100;
+                                                    const hPost = (d.post / maxTimeVal) * 100;
+                                                    return (
+                                                        <g key={i}>
+                                                            <rect x={x} y={150 - hPre} width={w} height={hPre} fill="#3b82f6" className="cursor-crosshair hover:opacity-80 transition-opacity">
+                                                                <title>{String(i).padStart(2, '0')}:00 - {String(i+1).padStart(2, '0')}:00&#10;Före-kontroller: {d.pre} st</title>
+                                                            </rect>
+                                                            <rect x={x + w + 1} y={150 - hPost} width={w} height={hPost} fill="#6366f1" className="cursor-crosshair hover:opacity-80 transition-opacity">
+                                                                <title>{String(i).padStart(2, '0')}:00 - {String(i+1).padStart(2, '0')}:00&#10;Efter-kontroller: {d.post} st</title>
+                                                            </rect>
+                                                            {i % 2 === 0 && <text x={x + w} y={170} fontSize="10" fill="#94a3b8" fontWeight="bold" textAnchor="middle">{String(i).padStart(2, '0')}</text>}
+                                                        </g>
+                                                    );
+                                                })}
+                                            </svg>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* --- FLIK 2: VERKSTAD --- */}
+                                <div className={reportTab === 'workshop' ? 'block' : 'hidden print:hidden'}>
+                                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                                        <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm print-break-inside-avoid lg:row-span-2">
+                                            <h3 className="font-bold text-lg text-slate-800 mb-1 flex items-center gap-2">
+                                                <Icon name="bar-chart-3" className="text-blue-500 w-5 h-5"/> Vanligaste anmärkningarna
+                                            </h3>
+                                            <p className="text-xs text-slate-500 mb-5">Visar vad som krånglar oftast.</p>
+                                            
+                                            {/* NYTT: Radardiagram */}
+                                            {renderRadarChart()}
+
+                                            <div className="space-y-4">
+                                                {topDefects.slice(0, 8).map((d, idx) => (
+                                                    <div key={d.name}>
+                                                        <div className="flex justify-between text-sm font-medium text-slate-700 mb-1">
+                                                            <span className="truncate pr-2">{idx+1}. {d.name}</span>
+                                                            <span className="font-bold text-slate-500">{d.total} st</span>
+                                                        </div>
+                                                        <div className="w-full bg-slate-100 h-2 rounded-full overflow-hidden flex">
+                                                            {d.warning > 0 && <div style={{width: `${(d.warning/d.total)*100}%`}} className="bg-yellow-400 h-full" title="Egen åtgärd"></div>}
+                                                            {d.error > 0 && <div style={{width: `${(d.error/d.total)*100}%`}} className="bg-red-500 h-full" title="Rapporterat fel"></div>}
+                                                        </div>
+                                                    </div>
+                                                ))}
+                                                {topDefects.length === 0 && <p className="text-sm text-slate-400 italic">Inga anmärkningar funna.</p>}
+                                            </div>
+                                        </div>
+
+                                        <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm print-break-inside-avoid">
+                                            <h3 className="font-bold text-lg text-slate-800 mb-1 flex items-center gap-2">
+                                                <Icon name="alert-triangle" className="text-red-500 w-5 h-5"/> Svarta listan (Fordon)
+                                            </h3>
+                                            <p className="text-xs text-slate-500 mb-5">Fordon med flest rena fel (Rött).</p>
+                                            <div className="space-y-3">
+                                                {topErrorVehicles.map((v, idx) => (
+                                                    <div key={v.reg} className="flex justify-between items-center border-b border-slate-50 pb-2">
+                                                        <div className="flex items-center gap-3 overflow-hidden">
+                                                            <span className="text-slate-400 font-bold text-sm shrink-0 w-4">{idx + 1}.</span>
+                                                            <span className="font-bold text-slate-700 truncate">{v.display}</span>
+                                                        </div>
+                                                        <span className="bg-red-50 text-red-700 font-bold text-xs px-2.5 py-1 rounded border border-red-200 shrink-0 ml-2">
+                                                            {v.errors} fel
+                                                        </span>
+                                                    </div>
+                                                ))}
+                                                {topErrorVehicles.length === 0 && <p className="text-sm text-slate-400 italic">Härligt, inga fel inrapporterade!</p>}
+                                            </div>
+                                        </div>
+
+                                        <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm print-break-inside-avoid">
+                                            <h3 className="font-bold text-lg text-slate-800 mb-1 flex items-center gap-2">
+                                                <Icon name="ghost" className="text-slate-400 w-5 h-5"/> Oanvända fordon
+                                            </h3>
+                                            <p className="text-xs text-slate-500 mb-5">Fordon i systemet med 0 kontroller.</p>
+                                            <div className="max-h-96 overflow-y-auto pr-2">
+                                                {unusedVehicles.map(v => (
+                                                    <div key={v['Namn']} className="flex justify-between items-center py-1.5 border-b border-slate-50">
+                                                        <span className="font-medium text-slate-600 text-sm truncate">{v.Internreferens ? `${v.Internreferens} (${v['Namn']})` : v['Namn']}</span>
+                                                        <span className="text-[10px] uppercase font-bold text-slate-400 bg-slate-100 px-2 py-0.5 rounded">Missad</span>
+                                                    </div>
+                                                ))}
+                                                {unusedVehicles.length === 0 && <p className="text-sm text-green-600 font-medium flex items-center gap-1"><Icon name="check-circle" className="w-4 h-4"/> Alla fordon är kontrollerade!</p>}
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* --- FLIK 3: PERSONAL --- */}
+                                <div className={reportTab === 'hr' ? 'block' : 'hidden print:hidden'}>
+                                    
+                                    <div className="bg-indigo-50 border border-indigo-200 p-6 rounded-2xl mb-6 shadow-sm print-break-inside-avoid">
+                                        <h3 className="font-bold text-indigo-900 mb-2 flex items-center gap-2 text-lg">
+                                            <Icon name="lightbulb" className="text-indigo-600 w-6 h-6"/> Insikter & Avvikelser (Tick-and-go detektion)
+                                        </h3>
+                                        <p className="text-sm text-indigo-800 mb-4 max-w-4xl leading-relaxed">
+                                            Systemet jämför chaufförer som kör samma fordon. Om en bil regelbundet får anmärkningar av andra, men <i>alltid</i> markeras som felfri av en specifik förare, flaggas det här nedanför. Ett bra underlag för dialog om att följa rutinerna.
+                                        </p>
+                                        {smartInsights.length > 0 ? (
+                                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                                                {smartInsights.map((insight, i) => (
+                                                    <div key={i} className="bg-white rounded-xl p-4 border border-indigo-100 shadow-sm relative overflow-hidden">
+                                                        <div className="absolute top-0 left-0 w-1 h-full bg-indigo-400"></div>
+                                                        <div className="font-bold text-slate-800 mb-1">{insight.driver}</div>
+                                                        <div className="text-xs text-slate-600 mb-2"><Icon name="truck" className="w-3 h-3 inline text-slate-400"/> Fordon: {insight.vehicle}</div>
+                                                        <div className="text-xs text-slate-500">
+                                                            Har utfört <b>{insight.checks} felfria pass</b> på en bil som i snitt har <b>anmärkningar i {insight.avgRate}%</b> av fallen när andra kör den.
+                                                        </div>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        ) : (
+                                            <div className="bg-white/60 text-indigo-700 text-sm font-medium py-3 px-4 rounded-xl border border-indigo-100 inline-flex items-center gap-2">
+                                                <Icon name="check-circle" className="w-5 h-5 text-indigo-500" /> Inga avvikande rapporteringsmönster upptäcktes för denna period.
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                        <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm print-break-inside-avoid">
+                                            <h3 className="font-bold text-lg text-slate-800 mb-1 flex items-center gap-2">
+                                                <Icon name="heart-handshake" className="text-yellow-500 w-5 h-5"/> Mest proaktiva (Vardagshjältar)
+                                            </h3>
+                                            <p className="text-xs text-slate-500 mb-5">Förare med flest egna åtgärder (Gula markeringar).</p>
+                                            <div className="space-y-3">
+                                                {topProactiveDrivers.filter(d=>d.warnings > 0).map((d, idx) => (
+                                                    <div key={d.name} className="flex justify-between items-center border-b border-slate-50 pb-2">
+                                                        <div className="flex items-center gap-3">
+                                                            <span className="text-slate-400 font-bold text-sm w-4">{idx + 1}.</span>
+                                                            <span className="font-bold text-slate-700">{d.name}</span>
+                                                        </div>
+                                                        <span className="bg-yellow-50 text-yellow-700 font-bold text-xs px-2.5 py-1 rounded border border-yellow-200 shrink-0">
+                                                            {d.warnings} åtgärder
+                                                        </span>
+                                                    </div>
+                                                ))}
+                                                {topProactiveDrivers.filter(d=>d.warnings > 0).length === 0 && <p className="text-sm text-slate-400 italic">Inga proaktiva åtgärder registrerade.</p>}
+                                            </div>
+                                        </div>
+
+                                        <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm print-break-inside-avoid">
+                                            <h3 className="font-bold text-lg text-slate-800 mb-1 flex items-center gap-2">
+                                                <Icon name="trophy" className="text-blue-500 w-5 h-5"/> Flitigaste inlämnarna
+                                            </h3>
+                                            <p className="text-xs text-slate-500 mb-5">Förare som skickat in flest totala kontroller.</p>
+                                            <div className="space-y-3">
+                                                {topDiligentDrivers.map((d, idx) => (
+                                                    <div key={d.name} className="flex justify-between items-center border-b border-slate-50 pb-2">
+                                                        <div className="flex items-center gap-3">
+                                                            <span className="text-slate-400 font-bold text-sm w-4">{idx + 1}.</span>
+                                                            <span className="font-medium text-slate-700">{d.name}</span>
+                                                        </div>
+                                                        <span className="bg-slate-100 text-slate-600 font-bold text-xs px-2.5 py-1 rounded shrink-0">
+                                                            {d.total} st
+                                                        </span>
+                                                    </div>
+                                                ))}
+                                                {topDiligentDrivers.length === 0 && <p className="text-sm text-slate-400 italic">Ingen data.</p>}
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* --- FLIK 4: AVDELNINGSJÄMFÖRELSE --- */}
+                                {reportDepartments.length === 0 && (
+                                    <div className={reportTab === 'compare' ? 'block' : 'hidden print:hidden'}>
+                                        <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-sm print-break-inside-avoid">
+                                            <h3 className="font-bold text-lg text-slate-800 mb-2 flex items-center gap-2">
+                                                <Icon name="bar-chart-horizontal" className="text-blue-600 w-5 h-5"/> Avdelningskampen
+                                            </h3>
+                                            <p className="text-sm text-slate-500 mb-8">Visar Helhets-index och Slutförandegrad (Compliance) per avdelning. Sorterat efter bäst index.</p>
+                                            
+                                            <div className="space-y-6">
+                                                {deptStats.map(d => (
+                                                    <div key={d.name} className="relative">
+                                                        <div className="flex justify-between items-end mb-1">
+                                                            <span className="font-bold text-slate-700">{d.name}</span>
+                                                            <div className="text-right">
+                                                                <span className="text-xs font-bold text-slate-400 uppercase tracking-wider mr-4">Index: <span className="text-blue-600 text-base">{d.health}</span></span>
+                                                                <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Compliance: <span className="text-slate-700">{d.compliance}%</span></span>
+                                                            </div>
+                                                        </div>
+                                                        <div className="w-full bg-slate-100 h-3 rounded-full overflow-hidden relative">
+                                                            <div style={{width: `${Math.min(100, d.health)}%`}} className="bg-blue-500 h-full absolute top-0 left-0 rounded-full z-10" title={`Helhets-index: ${d.health}`}></div>
+                                                            <div style={{width: `${Math.min(100, d.compliance)}%`}} className="bg-slate-300 h-full absolute top-0 left-0 rounded-full opacity-50" title={`Slutförandegrad: ${d.compliance}%`}></div>
+                                                        </div>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+
+                            </div>
+                        )}
+                    </div>
+                );
+            };
+
+            // ==========================================
+            // MODAL LOGIK (Detaljvy för Standard)
+            // ==========================================
+            let currentModalCheck = null;
+            let currentModalStatus = 'MISSING';
+            let currentModalPostCheck = null;
+            let currentModalPostStatus = 'MISSING';
+
+            if (selectedVehicle && currentView === 'overview') {
+                if (selectedVehicle.vehicle.isUnknown) {
+                    currentModalCheck = selectedVehicle.vehicle.checks.all[currentCheckIndex];
+                    currentModalStatus = currentModalCheck ? analyzeCheckStatus(currentModalCheck) : 'MISSING';
+                    currentModalPostCheck = selectedVehicle.vehicle.postChecks.all[currentCheckIndex];
+                    currentModalPostStatus = currentModalPostCheck ? analyzeCheckStatus(currentModalPostCheck) : 'MISSING';
+                } else {
+                    if (selectedVehicle.orphanedPost) {
+                         currentModalPostCheck = selectedVehicle.orphanedPost.all[currentCheckIndex];
+                         currentModalPostStatus = currentModalPostCheck ? analyzeCheckStatus(currentModalPostCheck) : 'MISSING';
+                    } else {
+                         currentModalCheck = selectedVehicle.checkData.all[currentCheckIndex];
+                         currentModalStatus = currentModalCheck ? analyzeCheckStatus(currentModalCheck) : 'MISSING';
+                         currentModalPostCheck = currentModalCheck ? getPostCheckForPreCheck(currentModalCheck) : null;
+                         currentModalPostStatus = currentModalPostCheck ? analyzeCheckStatus(currentModalPostCheck) : 'MISSING';
+                    }
+                }
+            }
+
+            const rawModalTrailer = currentModalCheck ? currentModalCheck['Regnr Släp'] : (currentModalPostCheck ? currentModalPostCheck['Regnr Släp'] : null);
+            const modalDisplayTrailer = formatTrailerDisplay(rawModalTrailer);
+
+
+            // ==========================================
+            // ROUTER: VILKEN VY SKA VISAS?
+            // ==========================================
+            if (currentView === 'tv') {
+                return (
+                    <div className="min-h-screen bg-slate-100 flex flex-col p-2 md:p-4 overflow-hidden">
+                        <div className="bg-white rounded-xl shadow-sm border border-slate-200 px-4 py-2 mb-4 flex justify-between items-center shrink-0 relative z-20">
+                            <div className="flex items-center gap-4">
+                                <h1 className="text-xl font-black text-slate-800 uppercase tracking-wide flex items-center gap-2">
+                                    <Icon name="monitor" className="text-blue-600 w-5 h-5" />
+                                    Daglig Kontroll
+                                </h1>
+                                <div className="hidden sm:flex items-center gap-2 text-sm font-medium text-slate-500 bg-slate-100 px-3 py-1 rounded-lg">
+                                    <Icon name="calendar" className="w-4 h-4" />
+                                    {selectedDate}
+                                </div>
+
+                                {/* Fordons-pill i TV-vy */}
+                                <div className="hidden md:flex items-center gap-2 text-xs font-medium text-slate-500 bg-slate-50 border border-slate-200 px-2 py-1 rounded-lg">
+                                    <Icon name="truck" className="w-3.5 h-3.5" />
+                                    <span title="När fordonsregistret senast hämtades">{lastVehicleUpdate ? lastVehicleUpdate.split(' ')[0] === new Date().toLocaleDateString('sv-SE') ? lastVehicleUpdate.split(' ')[1] : lastVehicleUpdate.split(' ')[0] : '...'}</span>
+                                    <button onClick={fetchVehicles} disabled={loadingVehicles} className="text-blue-600 hover:text-blue-800 transition-colors" title="Uppdatera fordonsfil">
+                                        <Icon name="refresh-cw" className={`w-3 h-3 ${loadingVehicles ? 'animate-spin' : ''}`} />
+                                    </button>
+                                </div>
+
+                                {tvSettings.carouselSpeed > 0 && tvSlides.length > 1 && (
+                                    <div className="text-[10px] font-bold text-green-600 uppercase tracking-wider flex items-center gap-1 bg-green-50 px-2 py-1 rounded">
+                                        <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
+                                        Karusell på ({tvSettings.carouselSpeed}s)
+                                    </div>
+                                )}
+                            </div>
+                            <div className="flex items-center gap-2">
+                                {tvSlides.length > 1 && (
+                                    <div className="flex items-center gap-1 mr-2 bg-slate-100 p-1 rounded-lg">
+                                        <button onClick={prevTvSlide} className="p-1.5 text-slate-500 hover:text-slate-800 hover:bg-slate-200 rounded"><Icon name="chevron-left" className="w-4 h-4"/></button>
+                                        <span className="text-xs font-bold text-slate-600 px-2">{currentSlideIndex + 1} / {tvSlides.length}</span>
+                                        <button onClick={nextTvSlide} className="p-1.5 text-slate-500 hover:text-slate-800 hover:bg-slate-200 rounded"><Icon name="chevron-right" className="w-4 h-4"/></button>
+                                    </div>
+                                )}
+                                <button onClick={() => fetchChecks(true)} className="p-2 text-slate-500 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors" title="Uppdatera kontroller">
+                                    <Icon name="refresh-cw" className={`w-5 h-5 ${refreshing ? 'animate-spin text-blue-600' : ''}`} />
+                                </button>
+                                <button onClick={() => setShowTVSettings(true)} className="p-2 text-slate-500 hover:text-slate-800 hover:bg-slate-200 rounded-lg transition-colors">
+                                    <Icon name="settings" className="w-5 h-5" />
+                                </button>
+                                <div className="h-6 w-px bg-slate-300 mx-1"></div>
+                                <button onClick={() => setCurrentView('overview')} className="px-3 py-1.5 bg-slate-200 text-slate-700 text-sm font-bold rounded-lg hover:bg-slate-300 transition-colors">
+                                    Avsluta TV-vy
+                                </button>
+                            </div>
+                        </div>
+
+                        {/* Paginering & Karusell visning */}
+                        <div className="flex-1 overflow-hidden relative">
+                            {tvSlides.length === 0 ? (
+                                <div className="flex h-full items-center justify-center text-slate-400">Inga fordon att visa.</div>
+                            ) : (
+                                <div 
+                                    className="absolute inset-0 flex transition-transform duration-700 ease-in-out"
+                                    style={{ transform: `translateX(-${currentSlideIndex * 100}%)` }}
+                                >
+                                    {tvSlides.map((slide) => (
+                                        <div key={slide.id} className="w-full h-full flex-shrink-0 px-2 pb-2">
+                                            <div className={`h-full flex flex-col p-4 rounded-xl border overflow-y-auto hide-scrollbar ${slide.isUnknown ? 'bg-indigo-50/50 border-indigo-200' : (slide.isCustom ? 'bg-blue-50/30 border-blue-200' : 'bg-white/50 border-slate-200/60')}`}>
+                                                <div className="flex justify-between items-center mb-4 pl-1 shrink-0">
+                                                    <h2 className={`text-lg font-bold uppercase tracking-wider flex items-center gap-2 ${slide.isUnknown ? 'text-indigo-600' : (slide.isCustom ? 'text-blue-600' : 'text-slate-600')}`}>
+                                                        {slide.isUnknown && <Icon name="help-circle" className="w-5 h-5" />}
+                                                        {slide.isCustom && <Icon name="folder-heart" className="w-5 h-5" />}
+                                                        {slide.depName} <span className="opacity-50 text-sm">({slide.vehicles.length} visade)</span>
+                                                    </h2>
+                                                    {slide.totalPages > 1 && (
+                                                        <div className="flex gap-1.5 bg-white/50 p-1.5 rounded-full border border-slate-200/60">
+                                                            {Array.from({ length: slide.totalPages }).map((_, i) => (
+                                                                <div key={i} className={`w-2.5 h-2.5 rounded-full ${i + 1 === slide.pageIndex ? 'bg-blue-600 shadow-sm' : 'bg-slate-300'}`}></div>
+                                                            ))}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                                <div className="grid grid-cols-[repeat(auto-fill,minmax(180px,1fr))] gap-2 sm:gap-3 auto-rows-max">
+                                                    {slide.vehicles.map(v => renderTVVehicleCard(v))}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+
+                        {/* TV Settings Modal */}
+                        {showTVSettings && (
+                            <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+                                <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden animate-in zoom-in-95">
+                                    <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50">
+                                        <h2 className="text-lg font-bold text-slate-800">TV-vy Inställningar</h2>
+                                        <button onClick={() => setShowTVSettings(false)} className="text-slate-400 hover:text-slate-600 p-1 rounded-full hover:bg-slate-200">
+                                            <Icon name="x" className="w-6 h-6" />
+                                        </button>
+                                    </div>
+                                    <div className="p-6 space-y-6 max-h-[70vh] overflow-y-auto">
+                                        <div>
+                                            <h3 className="font-semibold text-slate-700 mb-2 text-sm uppercase tracking-wider">Visa avdelningar</h3>
+                                            <p className="text-xs text-slate-500 mb-3">Markera vilka avdelningar som ska visas på denna skärm. Om ingen markeras visas alla.</p>
+                                            <div className="max-h-48 overflow-y-auto border border-slate-200 rounded-lg p-2 space-y-1">
+                                                {sortedDepartments.map(dep => (
+                                                    <label key={dep} className="flex items-center gap-3 p-2 hover:bg-slate-50 rounded cursor-pointer">
+                                                        <input 
+                                                            type="checkbox" 
+                                                            checked={tvSettings.departments.includes(dep)}
+                                                            onChange={() => toggleTvDepartment(dep)}
+                                                            className="w-4 h-4 text-blue-600 rounded border-slate-300 focus:ring-blue-500"
+                                                        />
+                                                        <span className="text-sm text-slate-700 font-medium">{dep}</span>
+                                                        {customDeps.hasOwnProperty(dep) && <Icon name="folder-heart" className="w-3 h-3 text-blue-400 ml-auto" />}
+                                                    </label>
+                                                ))}
+                                            </div>
+                                        </div>
+                                        
+                                        <div className="h-px bg-slate-100 w-full"></div>
+
+                                        <div className="grid grid-cols-2 gap-4">
+                                            <div>
+                                                <h3 className="font-semibold text-slate-700 mb-2 text-sm uppercase tracking-wider">Karusell-hastighet</h3>
+                                                <select 
+                                                    value={tvSettings.carouselSpeed}
+                                                    onChange={(e) => setTvSettings({...tvSettings, carouselSpeed: Number(e.target.value)})}
+                                                    className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm font-medium text-slate-700 bg-white"
+                                                >
+                                                    <option value={0}>Avstängd</option>
+                                                    <option value={5}>Var 5:e sekund</option>
+                                                    <option value={10}>Var 10:e sekund</option>
+                                                    <option value={15}>Var 15:e sekund</option>
+                                                    <option value={20}>Var 20:e sekund</option>
+                                                    <option value={30}>Var 30:e sekund</option>
+                                                </select>
+                                                <p className="text-[10px] text-slate-400 mt-1">Styr hur snabbt den byter "sida".</p>
+                                            </div>
+
+                                            <div>
+                                                <h3 className="font-semibold text-slate-700 mb-2 text-sm uppercase tracking-wider">Bilar per sida</h3>
+                                                <select 
+                                                    value={tvSettings.maxPerPage}
+                                                    onChange={(e) => setTvSettings({...tvSettings, maxPerPage: Number(e.target.value)})}
+                                                    className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm font-medium text-slate-700 bg-white"
+                                                >
+                                                    <option value={12}>12 fordon</option>
+                                                    <option value={16}>16 fordon</option>
+                                                    <option value={24}>24 fordon</option>
+                                                    <option value={32}>32 fordon</option>
+                                                    <option value={48}>48 fordon</option>
+                                                </select>
+                                                <p className="text-[10px] text-slate-400 mt-1">Avdelningen delas upp om den överskrider gränsen.</p>
+                                            </div>
+                                        </div>
+
+                                        <div className="h-px bg-slate-100 w-full"></div>
+
+                                        <div>
+                                            <h3 className="font-semibold text-slate-700 mb-2 text-sm uppercase tracking-wider">Data-uppdatering</h3>
+                                            <select 
+                                                value={tvSettings.refreshInterval}
+                                                onChange={(e) => setTvSettings({...tvSettings, refreshInterval: Number(e.target.value)})}
+                                                className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm font-medium text-slate-700 bg-white"
+                                            >
+                                                <option value={0}>Avstängd (Hämtar ej ny data)</option>
+                                                <option value={1}>Hämta ny data varje minut</option>
+                                                <option value={5}>Hämta var 5:e minut</option>
+                                                <option value={15}>Hämta var 15:e minut</option>
+                                                <option value={30}>Hämta var 30:e minut</option>
+                                            </select>
+                                            <p className="text-[10px] text-slate-400 mt-1">Styr hur ofta ny data hämtas i bakgrunden från Colix.</p>
+                                        </div>
+                                    </div>
+                                    <div className="p-4 border-t border-slate-100 bg-slate-50 flex justify-end">
+                                        <button onClick={() => setShowTVSettings(false)} className="px-5 py-2 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700">
+                                            Spara & Stäng
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                );
+            }
+
+            if (currentView === 'reports') {
+                return renderReports();
+            }
+
+            // STANDARD ÖVERBLICK
+            return (
+                <div className="max-w-[1600px] mx-auto relative">
+                    
+                    {/* GLOBAL MESSAGE MODAL FÖR ATT ERSÄTTA ALERT() */}
+                    {globalMessage && (
+                        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[100] flex items-center justify-center p-4">
+                            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden animate-in zoom-in-95">
+                                <div className="p-6 text-center">
+                                    <div className="w-16 h-16 bg-blue-50 text-blue-500 rounded-full flex items-center justify-center mx-auto mb-4">
+                                        <Icon name="info" className="w-8 h-8"/>
+                                    </div>
+                                    <h3 className="text-xl font-bold text-slate-800 mb-2">{globalMessage.title}</h3>
+                                    <p className="text-sm text-slate-500 mb-8">{globalMessage.message}</p>
+                                    <button onClick={() => setGlobalMessage(null)} className="px-6 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-medium transition-colors w-full">
+                                        Stäng
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* MODALER (Samma som förut) */}
+                    {showCreateDepModal && (
+                        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[60] flex items-center justify-center p-4">
+                            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden animate-in zoom-in-95">
+                                <div className="p-6">
+                                    <h3 className="text-xl font-bold text-slate-800 mb-2 flex items-center gap-2"><Icon name="folder-plus" className="w-6 h-6 text-blue-600" /> Skapa egen avdelning</h3>
+                                    <p className="text-sm text-slate-500 mb-5">Egna avdelningar sparas bara för dig. Här kan du samla fordon du vill ha extra koll på, oavsett deras ursprung.</p>
+                                    <input autoFocus type="text" value={newDepName} onChange={e => setNewDepName(e.target.value)} className="w-full border-2 border-slate-200 rounded-xl p-3 mb-6 focus:border-blue-500 focus:ring-0 outline-none text-slate-700 font-medium" placeholder="T.ex. Mina Nattbilar..." />
+                                    <div className="flex justify-end gap-3">
+                                        <button onClick={() => setShowCreateDepModal(false)} className="px-5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-medium transition-colors">Avbryt</button>
+                                        <button onClick={handleCreateDep} disabled={!newDepName.trim()} className="px-5 py-2.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-xl font-medium shadow-sm transition-colors">Spara flik</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {depToDelete && (
+                        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[60] flex items-center justify-center p-4">
+                            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm text-center p-6 animate-in zoom-in-95">
+                                <div className="w-16 h-16 bg-red-100 text-red-500 rounded-full flex items-center justify-center mx-auto mb-4"><Icon name="alert-triangle" className="w-8 h-8"/></div>
+                                <h3 className="text-xl font-bold text-slate-800 mb-2">Ta bort avdelning?</h3>
+                                <p className="text-sm text-slate-500 mb-8">Är du säker på att du vill ta bort "<b>{depToDelete}</b>"?<br/>Inga fordon eller kontroller raderas.</p>
+                                <div className="flex justify-center gap-3">
+                                    <button onClick={() => setDepToDelete(null)} className="px-6 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-medium transition-colors w-full">Avbryt</button>
+                                    <button onClick={confirmDeleteDep} className="px-6 py-2.5 bg-red-600 hover:bg-red-700 text-white rounded-xl font-medium shadow-sm transition-colors w-full">Ta bort</button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    <div className="sticky top-0 z-40 bg-slate-100/95 backdrop-blur-sm px-4 md:px-8 pt-4 md:pt-6 pb-4 border-b border-slate-200 mb-6 flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4">
+                        <div>
+                            <h1 className="text-3xl font-bold text-slate-800 flex items-center gap-3">
+                                <Icon name="clipboard-check" className="text-blue-600 w-8 h-8" /> Daglig Kontroll - Överblick
+                            </h1>
+                            <p className="text-slate-500 mt-1">Status för kontroller hämtade från fordon och chaufförer.</p>
+                        </div>
+                        
+                        <div className="flex flex-wrap items-center gap-3 bg-white p-2 rounded-xl shadow-sm border border-slate-200 w-full lg:w-auto">
+                            <button onClick={() => setCurrentView('reports')} className="flex items-center gap-2 px-4 py-1.5 bg-blue-50 text-blue-700 border border-blue-200 rounded-lg font-medium transition-all hover:bg-blue-100" title="Öppna statistik och rapporter">
+                                <Icon name="bar-chart-3" className="w-4 h-4" /> <span className="hidden sm:inline">Rapporter</span>
+                            </button>
+                            <button onClick={() => setCurrentView('tv')} className="flex items-center gap-2 px-3 py-1.5 bg-slate-800 text-white rounded-lg font-medium shadow-sm transition-all hover:bg-slate-900" title="Öppna kompakt vy anpassad för storskärm">
+                                <Icon name="monitor" className="w-4 h-4" /> <span className="hidden sm:inline">TV-vy</span>
+                            </button>
+                            <div className="h-6 w-px bg-slate-200 mx-1"></div>
+                            <div className="flex items-center gap-2 px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-500">
+                                <Icon name="truck" className="w-4 h-4" /> <span className="hidden xl:inline">Fordonsregister:</span> <span className="font-semibold">{lastVehicleUpdate || 'Laddar...'}</span>
+                                <button onClick={fetchVehicles} disabled={loadingVehicles} className="ml-1 text-blue-600 hover:text-blue-800 transition-colors" title="Hämta senaste fordonslistan"><Icon name="refresh-cw" className={`w-3.5 h-3.5 ${loadingVehicles ? 'animate-spin' : ''}`} /></button>
+                            </div>
+                            <div className="h-6 w-px bg-slate-200 mx-1"></div>
+                            <div className="flex items-center gap-2 px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg">
+                                <Icon name="calendar" className="w-5 h-5 text-slate-500" />
+                                <input type="date" value={selectedDate} onChange={(e) => setSelectedDate(e.target.value)} className="bg-transparent border-none text-slate-700 font-medium focus:outline-none focus:ring-0 cursor-pointer" />
+                            </div>
+                            <button onClick={() => fetchChecks(true)} disabled={refreshing} className={`flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg font-medium shadow-sm transition-all hover:bg-blue-700 focus:ring focus:ring-blue-300 disabled:opacity-70 disabled:cursor-not-allowed`} title="Uppdatera kontroller">
+                                <Icon name="refresh-cw" className={`w-4 h-4 ${refreshing ? 'animate-spin' : ''}`} /> <span className="hidden sm:inline">Kontroller</span>
+                            </button>
+                        </div>
+                    </div>
+
+                    <div className="px-4 md:px-8 pb-8 flex flex-col md:flex-row gap-6 lg:gap-8">
+                        <div className="w-full md:w-64 lg:w-72 shrink-0">
+                            <div className="md:sticky md:top-36 md:max-h-[calc(100vh-10rem)] md:overflow-y-auto hide-scrollbar pb-4">
+                                {sortedDepartments.length === 0 && (
+                                    <div className="text-center p-6 bg-white rounded-xl border border-slate-200 shadow-sm"><Icon name="inbox" className="w-12 h-12 mx-auto text-slate-300 mb-2" /><h3 className="font-semibold text-slate-600">Inga avdelningar</h3></div>
+                                )}
+                                {sortedDepartments.length > 0 && (
+                                    <div className="flex md:flex-col overflow-x-auto md:overflow-visible gap-3 pb-4 md:pb-0">
+                                        <div className="hidden md:flex items-center justify-between px-2 mb-1">
+                                            <h2 className="text-xs font-bold text-slate-400 uppercase tracking-wider">Välj Avdelning</h2>
+                                        </div>
+                                        {sortedDepartments.map(dep => {
+                                            const isUnknown = dep === 'Okända fordon'; const isCustom = customDeps.hasOwnProperty(dep);
+                                            let depVehicles = [];
+                                            if (isUnknown) depVehicles = unknownVehicles;
+                                            else if (isCustom) depVehicles = vehicles.filter(v => customDeps[dep].includes(v['Namn']));
+                                            else depVehicles = vehicles.filter(v => v.Avdelning === dep);
+
+                                            const activeDepVehicles = depVehicles.filter(v => !hiddenVehicles.includes(v['Namn']));
+                                            const activeCount = activeDepVehicles.length; const isActive = activeTab === dep;
+                                            
+                                            let okCount = 0, warnCount = 0, errCount = 0, incompleteCount = 0;
+                                            activeDepVehicles.forEach(v => {
+                                                let cData, s;
+                                                if (v.isUnknown) {
+                                                    cData = v.checks.latest || v.postChecks.latest; s = analyzeCheckStatus(cData);
+                                                } else {
+                                                    cData = getChecksForDate(v['Namn']).latest; s = analyzeCheckStatus(cData);
+                                                    if (!cData) { const pData = getOnlyPostChecksForDate(v['Namn']).latest; if (pData) s = "ERROR"; }
+                                                }
+                                                if (s === 'OK') okCount++; else if (s === 'WARNING') warnCount++; else if (s === 'ERROR') errCount++; else if (s === 'INCOMPLETE') incompleteCount++;
+                                            });
+
+                                            const isDepDragOver = dragOverDep === dep;
+                                            const depDragClasses = isDepDragOver ? "border-blue-500 border-t-4" : "";
+                                            let btnStyle = isActive ? 'bg-blue-600 border-blue-600 text-white shadow-md' : 'bg-white border-slate-200 hover:border-blue-300 hover:bg-blue-50';
+                                            if (isUnknown) btnStyle = isActive ? 'bg-indigo-600 border-indigo-600 text-white shadow-md' : 'bg-indigo-50 border-indigo-200 text-indigo-700 hover:border-indigo-400 hover:bg-indigo-100';
+                                            else if (isCustom) btnStyle = isActive ? 'bg-sky-600 border-sky-600 text-white shadow-md' : 'bg-sky-50/50 border-sky-200 text-sky-800 hover:border-sky-400 hover:bg-sky-100';
+
+                                            return (
+                                                <button key={dep} draggable={!isUnknown} onDragStart={!isUnknown ? (e) => handleDepDragStart(e, dep) : undefined} onDragEnd={!isUnknown ? handleDepDragEnd : undefined} onDragOver={!isUnknown ? (e) => handleDepDragOver(e, dep) : undefined} onDrop={!isUnknown ? (e) => handleDepDrop(e, dep) : undefined} onClick={() => setActiveTab(dep)} className={`group relative flex flex-col px-4 py-3 text-left transition-all rounded-xl border ${isUnknown ? 'cursor-pointer' : 'cursor-grab active:cursor-grabbing'} ${depDragClasses} ${btnStyle}`}>
+                                                    {isCustom && (
+                                                        <div onClick={(e) => { e.stopPropagation(); setDepToDelete(dep); }} className={`absolute top-2 right-2 p-1.5 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity ${isActive ? 'bg-white/20 hover:bg-red-500 hover:text-white text-blue-100' : 'bg-red-50 text-red-500 hover:bg-red-100'}`} title="Ta bort egen avdelning"><Icon name="trash-2" className="w-3.5 h-3.5" /></div>
+                                                    )}
+                                                    <div className="flex justify-between items-center w-full mb-2">
+                                                        <span className={`font-semibold text-sm truncate pr-8 flex items-center gap-1.5 ${isActive ? 'text-white' : ''}`}>
+                                                            {isUnknown && <Icon name="help-circle" className="w-4 h-4 shrink-0" />} {isCustom && <Icon name="folder-heart" className={`w-4 h-4 shrink-0 ${isActive ? 'text-sky-200' : 'text-sky-500'}`} />}
+                                                            <span className="truncate">{dep}</span>
+                                                        </span>
+                                                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold shrink-0 ${isActive ? 'bg-black/20 text-white' : (isUnknown ? 'bg-indigo-200 text-indigo-800' : (isCustom ? 'bg-sky-200 text-sky-800' : 'bg-slate-100 text-slate-500'))}`}>{activeCount} bilar</span>
+                                                    </div>
+                                                    <div className={`flex gap-3 text-[11px] font-bold ${isActive ? 'text-blue-100' : (isUnknown ? 'text-indigo-400' : (isCustom ? 'text-sky-600/60' : 'text-slate-400'))}`}>
+                                                        <div className={`flex items-center gap-1 ${okCount > 0 ? (isActive ? 'text-green-300' : 'text-green-600') : ''}`}><Icon name="circle-check" className="w-3.5 h-3.5" /> {okCount}</div>
+                                                        <div className={`flex items-center gap-1 ${warnCount > 0 ? (isActive ? 'text-yellow-300' : 'text-yellow-500') : ''}`}><Icon name="triangle-alert" className="w-3.5 h-3.5" /> {warnCount}</div>
+                                                        <div className={`flex items-center gap-1 ${errCount > 0 ? (isActive ? 'text-red-300' : 'text-red-500') : ''}`}><Icon name="circle-x" className="w-3.5 h-3.5" /> {errCount}</div>
+                                                        <div className={`flex items-center gap-1 ${incompleteCount > 0 ? (isActive ? 'text-orange-300' : 'text-orange-500') : ''}`}><Icon name="file-question" className="w-3.5 h-3.5" /> {incompleteCount}</div>
+                                                    </div>
+                                                </button>
+                                            );
+                                        })}
+                                        <button onClick={() => setShowCreateDepModal(true)} className="flex items-center justify-center gap-2 mt-2 px-4 py-3 border-2 border-dashed border-slate-300 text-slate-500 hover:text-blue-600 hover:border-blue-400 hover:bg-blue-50 transition-all rounded-xl text-sm font-bold w-full"><Icon name="plus" className="w-4 h-4" /> Skapa egen avdelning</button>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+
+                        <div className="flex-1 space-y-8">
+                            <div>
+                                {sortedActiveVehicles.length > 0 ? (
+                                    <>
+                                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
+                                            <span className="text-xs font-bold text-slate-400 uppercase tracking-wider pl-1">Aktiva fordon</span>
+                                            
+                                            {/* Sorterings-meny */}
+                                            {!isUnknownTab && (
+                                                <div className="flex flex-wrap items-center gap-2 bg-white px-2 py-1.5 rounded-lg border border-slate-200 shadow-sm">
+                                                    <Icon name="arrow-up-down" className="w-4 h-4 text-slate-400" />
+                                                    <select
+                                                        value={sortMethod}
+                                                        onChange={(e) => setSortMethod(e.target.value)}
+                                                        className="text-sm font-medium text-slate-600 bg-transparent focus:outline-none cursor-pointer"
+                                                    >
+                                                        <option value="custom">Egen sortering (Dra & Släpp)</option>
+                                                        <option value="internref">A-Ö (Internreferens)</option>
+                                                        <option value="regnr">A-Ö (Reg-nr)</option>
+                                                    </select>
+                                                </div>
+                                            )}
+                                        </div>
+
+                                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                                            {sortedActiveVehicles.map((vehicle) => renderVehicleCard(vehicle, false))}
+                                        </div>
+                                    </>
+                                ) : (
+                                    <div className="text-center p-8 border-2 border-dashed border-slate-200 rounded-xl"><p className="text-slate-500">Inga aktiva fordon att visa för denna avdelning.</p></div>
+                                )}
+                            </div>
+
+                            {inactiveVehicles.length > 0 && (
+                                <div>
+                                    <div className="flex items-center gap-3 mb-4 mt-8"><div className="h-px bg-slate-300 flex-1"></div><h3 className="text-sm font-bold text-slate-400 uppercase tracking-wider flex items-center gap-2"><Icon name="eye-off" className="w-4 h-4" /> Dolda fordon ({inactiveVehicles.length})</h3><div className="h-px bg-slate-300 flex-1"></div></div>
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                                        {inactiveVehicles.map((vehicle) => renderVehicleCard(vehicle, true))}
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+
+                    {/* NY MODAL FÖR FELRAPPORTER (IFRAMES) */}
+                    {reportModalData && (
+                        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[70] flex items-center justify-center p-4 md:p-6">
+                            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-[95vw] lg:max-w-7xl h-[85vh] flex flex-col overflow-hidden animate-in zoom-in-95">
+                                <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50 shrink-0">
+                                    <div>
+                                        <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2">
+                                            <Icon name="stethoscope" className="w-6 h-6 text-red-500" />
+                                            Felrapporter
+                                        </h2>
+                                        <p className="text-sm text-slate-500">Hantera registrerade fel för valt ekipage.</p>
+                                    </div>
+                                    <button onClick={() => setReportModalData(null)} className="text-slate-400 hover:text-slate-600 p-2 rounded-full hover:bg-slate-200 transition-colors">
+                                        <Icon name="x" className="w-6 h-6" />
+                                    </button>
+                                </div>
+                                
+                                <div className="flex-1 p-4 bg-slate-100/50 flex gap-4 overflow-hidden">
+                                    {/* Kolumn för Bil */}
+                                    <div className="flex-1 flex flex-col bg-white border border-slate-200 rounded-xl overflow-hidden shadow-sm">
+                                        <div className="bg-slate-50 px-4 py-3 border-b border-slate-200 flex items-center gap-2">
+                                            <Icon name="truck" className="w-5 h-5 text-slate-600" />
+                                            <span className="font-bold text-slate-800">
+                                                Bil: {reportModalData.truck.Internreferens ? `${reportModalData.truck.Internreferens} (${reportModalData.truck['Namn']})` : reportModalData.truck['Namn']}
+                                            </span>
+                                        </div>
+                                        <iframe 
+                                            src={buildIframeUrl(reportModalData.truckId)} 
+                                            className="w-full h-full flex-1 border-none bg-slate-50"
+                                            title="Felrapporter Bil"
+                                        />
+                                    </div>
+
+                                    {/* Kolumn för Släp (Visas bara om släp var inblandat i passet) */}
+                                    {reportModalData.trailerReg && (
+                                        <div className="flex-1 flex flex-col bg-white border border-slate-200 rounded-xl overflow-hidden shadow-sm">
+                                            <div className="bg-slate-50 px-4 py-3 border-b border-slate-200 flex items-center gap-2">
+                                                <Icon name="trailer" className="w-5 h-5 text-slate-600" />
+                                                <span className="font-bold text-slate-800">
+                                                    Släp: {reportModalData.trailerObj && reportModalData.trailerObj.Internreferens ? `${reportModalData.trailerObj.Internreferens} (${reportModalData.trailerObj['Namn']})` : (reportModalData.trailerObj ? reportModalData.trailerObj['Namn'] : String(reportModalData.trailerReg).toUpperCase())}
+                                                </span>
+                                            </div>
+                                            
+                                            {reportModalData.trailerObj && reportModalData.trailerObj['Formulärsvar ID (read-only)'] ? (
+                                                <iframe 
+                                                    src={buildIframeUrl(reportModalData.trailerObj['Formulärsvar ID (read-only)'])} 
+                                                    className="w-full h-full flex-1 border-none bg-slate-50"
+                                                    title="Felrapporter Släp"
+                                                />
+                                            ) : (
+                                                <div className="flex-1 flex flex-col items-center justify-center p-8 text-center bg-slate-50">
+                                                    <Icon name="alert-circle" className="w-16 h-16 text-slate-300 mb-4" />
+                                                    <h3 className="text-lg font-bold text-slate-600 mb-2">Okänt släp</h3>
+                                                    <p className="text-slate-500">Släpet <b>{String(reportModalData.trailerReg).toUpperCase()}</b> finns inte i fordonsregistret. Felrapporter kan därför inte visas för denna enhet.</p>
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Modal för detaljer (Original) */}
+                    {selectedVehicle && currentView === 'overview' && (
+                        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-[50] flex items-center justify-center p-4">
+                            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[90vh] flex flex-col overflow-hidden animate-in fade-in zoom-in-95 duration-200">
+                                <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50">
+                                    <div className="flex items-center gap-4">
+                                        <div className={`p-3 rounded-xl shrink-0 ${selectedVehicle.vehicle.isUnknown ? 'bg-indigo-100 text-indigo-700' : 'bg-blue-100 text-blue-700'}`}><Icon name={selectedVehicle.vehicle.isUnknown ? "help-circle" : "truck"} className="w-6 h-6" /></div>
+                                        <div>
+                                            {selectedVehicle.vehicle.Internreferens && <span className="text-2xl font-extrabold text-slate-800 tracking-tight block mb-1">{selectedVehicle.vehicle.Internreferens}</span>}
+                                            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mb-1.5">
+                                                <h2 className={`${selectedVehicle.vehicle.Internreferens ? 'text-sm text-slate-500' : 'text-xl text-slate-800'} font-bold leading-none`}>{selectedVehicle.vehicle['Namn']}</h2>
+                                                {modalDisplayTrailer && <span className="px-2 py-0.5 bg-indigo-50 text-indigo-700 font-semibold text-xs rounded border border-indigo-100 flex items-center gap-1.5 shadow-sm"><Icon name="trailer" className="w-3 h-3" /> {modalDisplayTrailer}</span>}
+                                            </div>
+                                            <p className="text-xs text-slate-500 font-medium">{selectedVehicle.vehicle['Avdelning']}</p>
+                                        </div>
+                                    </div>
+                                    <button onClick={() => setSelectedVehicle(null)} className="text-slate-400 hover:text-slate-600 p-2 rounded-full hover:bg-slate-200 transition-colors"><Icon name="x" className="w-6 h-6" /></button>
+                                </div>
+
+                                <div className="p-6 overflow-y-auto bg-slate-100/50">
+                                    {(!currentModalCheck && !currentModalPostCheck) ? (
+                                        <div className="text-center py-12 bg-white rounded-xl border border-slate-200"><Icon name="file-question" className="w-16 h-16 mx-auto text-slate-300 mb-4" /><h3 className="text-lg font-medium text-slate-600">Ingen kontroll utförd</h3><p className="text-slate-500 text-sm mt-1">Det finns ingen registrerad kontroll för detta fordon under det valda datumet.</p></div>
+                                    ) : (
+                                        <div className="space-y-8">
+                                            {/* DEL 1: FÖRE KÖRNING */}
+                                            <div className={`bg-white p-6 rounded-2xl border shadow-sm ${!currentModalCheck && currentModalPostCheck ? 'border-red-300 bg-red-50/30' : 'border-slate-200'}`}>
+                                                <h3 className="text-lg font-bold text-slate-800 mb-4 flex items-center gap-2"><Icon name="truck" className={`w-5 h-5 ${!currentModalCheck && currentModalPostCheck ? 'text-red-500' : 'text-blue-600'}`} /> 1. Före körning</h3>
+                                                {!currentModalCheck && currentModalPostCheck ? (
+                                                    <div className="bg-red-50 border border-red-200 rounded-xl p-6 text-center"><Icon name="alert-triangle" className="w-10 h-10 mx-auto text-red-400 mb-3" /><p className="font-bold text-red-700">Saknar kontroll före körning!</p><p className="text-sm text-red-600/80 mt-1 max-w-md mx-auto">Detta pass avslutades med en Efter-kontroll, men systemet hittar ingen tillhörande Före-kontroll.</p></div>
+                                                ) : (
+                                                    <>
+                                                        {selectedVehicle.checkData && selectedVehicle.checkData.all && selectedVehicle.checkData.all.length > 1 && (
+                                                            <div className="bg-blue-50 border border-blue-200 text-blue-800 p-3 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-sm shadow-sm mb-6">
+                                                                <div className="flex items-center gap-3"><Icon name="layers" className="w-5 h-5 shrink-0 text-blue-600" /><div><strong className="block">Flera kontroller hittades ({selectedVehicle.checkData.all.length} st)</strong><span className="text-blue-700/80 text-xs">Använd knapparna för att bläddra i tiden.</span></div></div>
+                                                                <div className="flex items-center gap-1.5 bg-white/60 p-1.5 rounded-lg border border-blue-100 shrink-0">
+                                                                    <button onClick={() => setCurrentCheckIndex(prev => Math.min(prev + 1, selectedVehicle.checkData.all.length - 1))} disabled={currentCheckIndex === selectedVehicle.checkData.all.length - 1} className="px-2 py-1.5 bg-white text-blue-700 hover:bg-blue-100 disabled:opacity-40 rounded shadow-sm border border-blue-200 flex items-center gap-1"><Icon name="chevron-left" className="w-4 h-4" /><span className="text-xs font-bold hidden sm:inline">Äldre</span></button>
+                                                                    <span className="font-bold text-xs px-2 min-w-[50px] text-center">{selectedVehicle.checkData.all.length - currentCheckIndex} / {selectedVehicle.checkData.all.length}</span>
+                                                                    <button onClick={() => setCurrentCheckIndex(prev => Math.max(prev - 1, 0))} disabled={currentCheckIndex === 0} className="px-2 py-1.5 bg-white text-blue-700 hover:bg-blue-100 disabled:opacity-40 rounded shadow-sm border border-blue-200 flex items-center gap-1"><span className="text-xs font-bold hidden sm:inline">Nyare</span><Icon name="chevron-right" className="w-4 h-4" /></button>
+                                                                </div>
+                                                            </div>
+                                                        )}
+                                                        <div className="flex flex-wrap gap-4 p-4 bg-slate-50 rounded-xl border border-slate-100 mb-6">
+                                                            <div className="flex-1 min-w-[120px]"><span className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">Förare</span><span className="font-medium text-slate-800">{currentModalCheck['Respondent (read-only)']}</span></div>
+                                                            <div className="flex-1 min-w-[120px]"><span className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">Tidpunkt (Start)</span><span className="font-medium text-slate-800">{currentModalCheck['Datum/tid']}</span></div>
+                                                            <div className="flex-1 min-w-[160px]"><span className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">Status (Före)</span>
+                                                                {currentModalStatus === 'OK' && <span className="font-bold text-green-600 flex items-start gap-1"><Icon name="circle-check" className="w-4 h-4 mt-0.5 shrink-0"/> Godkänd</span>}
+                                                                {currentModalStatus === 'WARNING' && <span className="font-bold text-yellow-600 flex items-start gap-1"><Icon name="triangle-alert" className="w-4 h-4 mt-0.5 shrink-0"/> Egen åtgärd</span>}
+                                                                {currentModalStatus === 'ERROR' && <span className="font-bold text-red-600 flex items-start gap-1"><Icon name="circle-x" className="w-4 h-4 mt-0.5 shrink-0"/> Fel att rapportera</span>}
+                                                                {currentModalStatus === 'INCOMPLETE' && <span className="font-bold text-orange-600 flex items-start gap-1"><Icon name="file-question" className="w-4 h-4 mt-0.5 shrink-0"/> Ofullständig</span>}
+                                                            </div>
+                                                        </div>
+                                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                                            {Object.entries(currentModalCheck).map(([question, answer], i) => {
+                                                                if (['Datum/tid', 'Regnr Bil', 'Regnr Släp', 'Respondent (read-only)', 'Skapat (read-only)', 'Senast ändrat (read-only)', 'Formulärsvar ID (read-only)'].includes(question)) return null;
+                                                                
+                                                                const isEmpty = !answer || String(answer).trim() === '';
+                                                                let iconEl = <Icon name="circle-check" className="w-5 h-5 text-green-500" />;
+                                                                
+                                                                if (isEmpty) {
+                                                                    iconEl = <Icon name="minus-circle" className="w-5 h-5 text-slate-300" />;
+                                                                } else {
+                                                                    const f = String(answer).trim().charAt(0);
+                                                                    if (f === '3') iconEl = <Icon name="circle-x" className="w-5 h-5 text-red-600" />;
+                                                                    else if (f === '2') iconEl = <Icon name="triangle-alert" className="w-5 h-5 text-yellow-500" />;
+                                                                }
+                                                                
+                                                                return (
+                                                                    <div key={i} className={`flex justify-between items-center p-3.5 border rounded-xl transition-all cursor-help ${isEmpty ? 'bg-slate-50/50 border-slate-100 text-slate-400' : 'bg-slate-50 border-slate-200 hover:bg-slate-100 text-slate-700'}`} title={`Fråga: ${question}\n\nSvar: ${isEmpty ? 'Inget svar' : answer}`}>
+                                                                        <span className={`text-sm font-medium truncate pr-2 ${isEmpty ? 'italic' : ''}`}>{shortenQuestion(question)} {isEmpty && <span className="text-[9px] ml-2 font-bold uppercase bg-slate-200/70 text-slate-500 px-1.5 py-0.5 rounded">Ej besvarad</span>}</span>
+                                                                        <div className="shrink-0 ml-2">{iconEl}</div>
+                                                                    </div>
+                                                                );
+                                                            })}
+                                                        </div>
+                                                    </>
+                                                )}
+                                            </div>
+
+                                            {/* DEL 2: EFTER KÖRNING */}
+                                            <div className="relative">
+                                                <div className="absolute left-6 -top-8 bottom-0 w-0.5 bg-slate-200 z-0"></div>
+                                                <div className="relative z-10 bg-white p-6 rounded-2xl border border-slate-200 shadow-sm ml-0">
+                                                    <h3 className="text-lg font-bold text-slate-800 mb-4 flex items-center gap-2"><Icon name="parking" className="w-5 h-5 text-blue-600" /> 2. Efter körning (Avslutat pass)</h3>
+                                                    {currentModalPostCheck ? (
+                                                        <>
+                                                            <div className="flex flex-wrap gap-4 p-4 bg-slate-50 rounded-xl border border-slate-100 mb-6">
+                                                                <div className="flex-1 min-w-[120px]"><span className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">Tidpunkt (Avslut)</span><span className="font-medium text-slate-800">{currentModalPostCheck['Datum/tid']}</span></div>
+                                                                <div className="flex-1 min-w-[160px]"><span className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-1">Status (Efter)</span>
+                                                                    {currentModalPostStatus === 'OK' && <span className="font-bold text-green-600 flex items-start gap-1"><Icon name="circle-check" className="w-4 h-4 mt-0.5 shrink-0"/> Godkänd</span>}
+                                                                    {currentModalPostStatus === 'WARNING' && <span className="font-bold text-yellow-600 flex items-start gap-1"><Icon name="triangle-alert" className="w-4 h-4 mt-0.5 shrink-0"/> Egen åtgärd</span>}
+                                                                    {currentModalPostStatus === 'ERROR' && <span className="font-bold text-red-600 flex items-start gap-1"><Icon name="circle-x" className="w-4 h-4 mt-0.5 shrink-0"/> Fel att rapportera</span>}
+                                                                    {currentModalPostStatus === 'INCOMPLETE' && <span className="font-bold text-orange-600 flex items-start gap-1"><Icon name="file-question" className="w-4 h-4 mt-0.5 shrink-0"/> Ofullständig</span>}
+                                                                </div>
+                                                            </div>
+                                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                                                {Object.entries(currentModalPostCheck).map(([question, answer], i) => {
+                                                                    if (['Datum/tid', 'Regnr Bil', 'Regnr Släp', 'Respondent (read-only)', 'Skapat (read-only)', 'Senast ändrat (read-only)', 'Formulärsvar ID (read-only)'].includes(question)) return null;
+                                                                    
+                                                                    const isEmpty = !answer || String(answer).trim() === '';
+                                                                    let iconEl = <Icon name="circle-check" className="w-5 h-5 text-green-500" />;
+                                                                    
+                                                                    if (isEmpty) {
+                                                                        iconEl = <Icon name="minus-circle" className="w-5 h-5 text-slate-300" />;
+                                                                    } else {
+                                                                        const f = String(answer).trim().charAt(0);
+                                                                        if (f === '3') iconEl = <Icon name="circle-x" className="w-5 h-5 text-red-600" />;
+                                                                        else if (f === '2') iconEl = <Icon name="triangle-alert" className="w-5 h-5 text-yellow-500" />;
+                                                                    }
+                                                                    
+                                                                    return (
+                                                                        <div key={i} className={`flex justify-between items-center p-3.5 border rounded-xl transition-all cursor-help ${isEmpty ? 'bg-slate-50/50 border-slate-100 text-slate-400' : 'bg-slate-50 border-slate-200 hover:bg-slate-100 text-slate-700'}`} title={`Fråga: ${question}\n\nSvar: ${isEmpty ? 'Inget svar' : answer}`}>
+                                                                            <span className={`text-sm font-medium truncate pr-2 ${isEmpty ? 'italic' : ''}`}>{shortenQuestion(question)} {isEmpty && <span className="text-[9px] ml-2 font-bold uppercase bg-slate-200/70 text-slate-500 px-1.5 py-0.5 rounded">Ej besvarad</span>}</span>
+                                                                            <div className="shrink-0 ml-2">{iconEl}</div>
+                                                                        </div>
+                                                                    );
+                                                                })}
+                                                            </div>
+                                                        </>
+                                                    ) : (
+                                                        <div className="bg-slate-50 border border-slate-200 rounded-xl p-8 text-center"><Icon name="clock-4" className="w-10 h-10 mx-auto text-slate-300 mb-3" /><p className="font-bold text-slate-600">Körpasset pågår (Ej avslutat)</p><p className="text-sm text-slate-500 mt-1 max-w-md mx-auto">Systemet inväntar att chauffören gör en "Kontroll efter körning" för detta pass.</p></div>
+                                                    )}
+                                                </div>
+                                            </div>
+                                            
+                                            <div className="mt-6 bg-slate-50 border border-slate-200 rounded-xl p-4">
+                                                <h4 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-3">Symbolförklaring & Status</h4>
+                                                <div className="space-y-3 text-sm">
+                                                    <div className="flex items-start gap-3"><Icon name="circle-check" className="w-5 h-5 text-green-500 shrink-0 mt-0.5" /><span className="text-slate-700 font-medium">Kontrollerad utan anmärkning.</span></div>
+                                                    <div className="flex items-start gap-3"><Icon name="triangle-alert" className="w-5 h-5 text-yellow-500 shrink-0 mt-0.5" /><span className="text-slate-700 font-medium">Proaktiv: Chaufför har åtgärdat upptäckta brister.</span></div>
+                                                    <div className="flex items-start gap-3"><Icon name="circle-x" className="w-5 h-5 text-red-600 shrink-0 mt-0.5" /><span className="text-slate-700 font-medium">Rapporterat fel: Kräver externt underhåll.</span></div>
+                                                    <div className="flex items-start gap-3"><Icon name="file-question" className="w-5 h-5 text-orange-500 shrink-0 mt-0.5" /><span className="text-slate-700 font-medium">Ofullständig: Kritisk fråga (t.ex. bromsar, däck) ej besvarad.</span></div>
+                                                    <div className="flex items-start gap-3"><Icon name="minus-circle" className="w-5 h-5 text-slate-300 shrink-0 mt-0.5" /><span className="text-slate-700 font-medium">Överhoppad fråga (ej kritisk, accepteras av systemet).</span></div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                                <div className="p-4 border-t border-slate-100 bg-slate-50 flex justify-end gap-3 rounded-b-2xl"><button onClick={() => setSelectedVehicle(null)} className="px-6 py-2.5 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg font-semibold transition-colors">Stäng</button></div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
